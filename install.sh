@@ -12,7 +12,7 @@ LIBERNET_WWW="/www/libernet"
 STATUS_LOG="${LIBERNET_DIR}/log/status.log"
 DOWNLOADS_DIR="${HOME}/Downloads"
 LIBERNET_TMP="${DOWNLOADS_DIR}/libernet"
-REPOSITORY_URL="https://github.com/vpnlegasi/libernet"
+REPOSITORY_URL="https://github.com/vpnlegasi/libernet-xray"
 
 # Compare two versions, returns 0 if $1 < $2
 function version_lt() {
