@@ -12,7 +12,7 @@ LIBERNET_WWW="/www/libernet"
 STATUS_LOG="${LIBERNET_DIR}/log/status.log"
 DOWNLOADS_DIR="${HOME}/Downloads"
 LIBERNET_TMP="${DOWNLOADS_DIR}/libernet"
-REPOSITORY_URL="https://github.com/vpnlegasi/libernet-xray"
+REPOSITORY_URL="https://github.com/vpnlegasi/libernet"
 
 # Compare two versions, returns 0 if $1 < $2
 function version_lt() {
@@ -260,77 +260,31 @@ function install_proprietary_binaries() {
   done
 }
 
-install_proprietary_packages() {
-  echo ""
-  echo "=== Proprietary Package Installer ==="
-  echo "1) V2Ray"
-  echo "2) Xray"
-  printf "Choose your engine [1-2]: "
-  read choice
 
-  case "$choice" in
-    1) SELECTED="v2ray" ;;
-    2) SELECTED="xray" ;;
-    *)
-      echo "Invalid choice. Defaulting to V2Ray."
-      SELECTED="v2ray"
-      ;;
-  esac
+function install_proprietary_packages() {
+  echo -e "Installing proprietary packages"
+  packages=(
+    xray
+  )
 
-  echo "Selected engine: $SELECTED"
-  echo ""
-
-  # Detect current installed engine
-  CURRENT=""
-  if command -v v2ray >/dev/null 2>&1; then CURRENT="v2ray"; fi
-  if command -v xray >/dev/null 2>&1; then CURRENT="xray"; fi
-
-  if [ -n "$CURRENT" ]; then
-      echo "Current installed engine: $CURRENT"
-  else
-      echo "No engine currently installed."
-  fi
-
-  # If same engine → skip
-  if [ "$CURRENT" = "$SELECTED" ]; then
-      echo "$SELECTED already installed, skipping installation."
-      return
-  fi
-
-  # If different → remove old engine
-  if [ -n "$CURRENT" ] && [ "$CURRENT" != "$SELECTED" ]; then
-      echo "Removing existing engine: $CURRENT ..."
-      opkg remove "$CURRENT" >/dev/null 2>&1
-      echo "$CURRENT removed."
-  fi
-
-  # Install new selected engine
-  pkg="/tmp/${SELECTED}.ipk"
-  echo "Installing $SELECTED ..."
-
-  if curl -fsSL -o "$pkg" "https://github.com/vpnlegasi/libernet-core/raw/main/${ARCH}/packages/${SELECTED}.ipk"; then
-      if opkg install "$pkg" >/dev/null 2>&1; then
-          echo "Installed $SELECTED successfully."
-
-          # Buat symlink Xray
-          if [ "$SELECTED" = "xray" ]; then
-              # Pastikan path sebenar Xray di /rom/usr/bin/xray atau /usr/bin/xray
-              if [ -f /usr/bin/xray ]; then
-                  ln -sf /usr/bin/xray /usr/bin/v2ray
-              elif [ -f /rom/usr/bin/xray ]; then
-                  ln -sf /rom/usr/bin/xray /usr/bin/v2ray
-              fi
-              echo "Symlink /usr/bin/v2ray → /usr/bin/xray created."
-          fi
-
+  for line in "${packages[@]}"; do
+    if ! command -v "${line}" >/dev/null 2>&1; then
+      pkg="/tmp/${line}.ipk"
+      echo "Installing ${line} ..."
+      if curl -fsSL -o "${pkg}" "https://github.com/vpnlegasi/libernet-core/raw/main/${ARCH}/packages/${line}.ipk"; then
+        if opkg install "${pkg}" >/dev/null 2>&1; then
+          echo "Installed ${line} successfully."
+        else
+          echo "Warning: failed to install ${line}, skipping..."
+        fi
       else
-          echo "Warning: failed to install $SELECTED."
+        echo "Warning: failed to download ${line}.ipk, skipping..."
       fi
-  else
-      echo "Warning: failed to download $SELECTED.ipk"
-  fi
-
-  rm -f "$pkg"
+      rm -f "${pkg}"
+    else
+      echo "${line} already installed, skipping."
+    fi
+  done
 }
 
 function install_proprietary() {
@@ -475,16 +429,14 @@ function finish_install() {
   clear
   chmod +x /root/libernet/bin/*
   router_ip="$(ifconfig br-lan | grep 'inet addr:' | awk '{print $2}' | awk -F ':' '{print $2}')"
+  echo -e "Libernet URL: http://${router_ip}/libernet"
+  echo -e "Username : admin"
+  echo -e "Password : vpnlegasi"
   echo -e "Libernet successfully installed!"
-  echo -e "Libernet URL       : http://${router_ip}/libernet"
-  echo -e "Default Username   : admin"
-  echo -e "Default Password   : vpnlegasi"
 }
-
 
 function clean_install() {
   rm -rf /root/install.sh > /dev/null 2>&1
-  rm -rf /tmp/install.sh > /dev/null 2>&1
   rm -rf /root/Downloads > /dev/null 2>&1
   find /root/libernet/bin -type f -exec chmod +x {} \; > /dev/null 2>&1
   sleep 10
@@ -492,16 +444,16 @@ function clean_install() {
   reboot
 }
 
-main_installer() {
-  install_requirements
-  install_libernet
-  add_libernet_environment
-  enable_uhttp_php
-  configure_vpnlegasi_firewall
-  configure_libernet_service
-  setup_system_logs
-  finish_install
-  clean_install
+function main_installer() {
+  install_requirements \
+    && install_libernet \
+    && add_libernet_environment \
+    && enable_uhttp_php \
+    && configure_vpnlegasi_firewall \
+    && configure_libernet_service \
+    && setup_system_logs \
+    && finish_install \
+    && clean_install
 }
 
 function main() {
@@ -522,9 +474,7 @@ function main() {
   if [[ ! -d "${LIBERNET_TMP}" ]]; then
     git clone --depth 1 "${REPOSITORY_URL}" "${LIBERNET_TMP}" \
       && cd "${LIBERNET_TMP}" \
-      && chmod +x install.sh \
-      && ./install.sh
-
+      && bash install.sh
   else
     cd "${LIBERNET_TMP}" \
       && main_installer
