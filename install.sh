@@ -261,54 +261,28 @@ function install_proprietary_binaries() {
 }
 
 function install_proprietary_packages() {
-  echo -e "Installing proprietary packages"
-  packages=(
-    xray
-  )
+  echo -e "Installing Xray"
 
-  for line in "${packages[@]}"; do
-    pkg="/tmp/${line}.ipk"
-    fallback_zip="/tmp/xray-fallback.zip"
-    echo "Downloading latest ${line} from Libernet repo..."
-    if ! curl -fsSL -o "${pkg}" "https://github.com/vpnlegasi/libernet-core/raw/main/${ARCH}/packages/${line}.ipk"; then
-      echo "Libernet repo xray.ipk not found, fallback to official Xray release"
-      # Tentukan ARCH untuk Xray
-      case "$ARCH" in
-        aarch64*) arch="arm64" ;;
-        arm*)    arch="arm32-v7a" ;;
-        mips*)   arch="mipsle" ;;
-        x86_64)  arch="64" ;;
-        i386)    arch="32" ;;
-        *)       arch="64" ;;
-      esac
-      echo "Downloading official Xray release for $arch..."
-      curl -fsSL -o "${fallback_zip}" "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${arch}.zip" || { 
-        echo "Failed to download official Xray release, skipping..."; continue; 
-      }
-      unzip -o "${fallback_zip}" -d /tmp >/dev/null 2>&1
-      chmod +x /tmp/xray
-      mv /tmp/xray /usr/bin/xray
-      rm -f "${fallback_zip}"
-      echo "Installed Xray from official release"
-      continue
-    fi
+  XRAY_DIR="/usr/bin"
+  PART1_URL="${REPOSITORY_URL}/raw/main/xray_arm64.part.aa"
+  PART2_URL="${REPOSITORY_URL}/raw/main/xray_arm64.part.ab"
 
-    # Remove old Xray if exists
-    if command -v xray >/dev/null 2>&1; then
-      echo "Removing old Xray..."
-      opkg remove xray >/dev/null 2>&1
-      rm -f /usr/bin/xray
-    fi
+  TMP1="/tmp/xray_arm64.part.aa"
+  TMP2="/tmp/xray_arm64.part.ab"
+  OUT="/usr/bin/xray"
 
-    echo "Installing ${line} from Libernet repo..."
-    if opkg install "${pkg}" >/dev/null 2>&1; then
-      echo "Installed ${line} successfully."
-      chmod +x /usr/bin/xray
-    else
-      echo "Warning: failed to install ${line} from Libernet repo, skipping..."
-    fi
-    rm -f "${pkg}"
-  done
+  echo "Downloading Xray part files..."
+  curl -fsSL -o "$TMP1" "$PART1_URL" || { echo "Failed download part.aa"; return; }
+  curl -fsSL -o "$TMP2" "$PART2_URL" || { echo "Failed download part.ab"; return; }
+
+  echo "Combining split files..."
+  cat "$TMP1" "$TMP2" > "$OUT"
+
+  echo "Setting permissions..."
+  chmod +x "$OUT"
+
+  echo "Cleaning temporary files..."
+  rm -f "$TMP1" "$TMP2"
 }
 
 function install_proprietary() {
