@@ -6,7 +6,7 @@ opkg update && opkg install bash wget
 
 #Installation
 ```
-wget -O - https://raw.githubusercontent.com/vpnlegasi/libernet/main/install.sh | bash
+wget -O - https://raw.githubusercontent.com/vpnlegasi/libernet-xray/main/install.sh | bash
 ```
 
 #Log in info
