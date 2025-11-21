@@ -47,6 +47,7 @@
                                 <div class="col-lg-4 col-md-3 form-row py-1">
                                     <div class="col d-flex">
                                         <button type="submit" class="btn btn-secondary mr-1">Load</button>
+                                        <button v-if="config.profile && config.temp.mode === 1" class="btn btn-success mr-1" @click="copyXrayUrl">Copy XRay URL</button>
                                         <button type="button" class="btn btn-danger ml-1" @click="deleteConfig">Delete</button>
                                     </div>
                                 </div>

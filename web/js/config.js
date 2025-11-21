@@ -364,6 +364,62 @@ const app = new Vue({
                 this.resolveServerHost()
             })
         },
+        copyXrayUrl() {
+            const p = this.config.temp.modes[1].profile
+            if(!p.protocol) {
+                Swal.fire({
+                    position: "center",
+                    icon: "warning",
+                    title: "No XRay profile loaded!",
+                    showConfirmButton: false,
+                    timer: 1500
+                });
+                return;
+            }
+
+            let url = ""
+            switch(p.protocol) {
+                case "vless":
+                    url = `vless://${p.server.user.vless.id}@${p.server.host}:${p.server.port}?type=${p.network}&security=${p.security}&sni=${p.stream.sni}&path=${p.stream.path}#${this.config.temp.profile}`;
+                    break;
+                case "vmess":
+                    url = `vmess://${btoa(JSON.stringify({
+                        v: "2",
+                        ps: this.config.temp.profile,
+                        add: p.server.host,
+                        port: p.server.port,
+                        id: p.server.user.vmess.id,
+                        aid: p.server.user.level,
+                        net: p.network,
+                        type: p.server.user.vmess.security,
+                        host: p.stream.sni,
+                        path: p.stream.path,
+                        tls: p.security
+                    }))}`;
+                    break;
+                case "trojan":
+                    url = `trojan://${p.server.user.trojan.password}@${p.server.host}:${p.server.port}?sni=${p.stream.sni}#${this.config.temp.profile}`;
+                    break;
+            }
+
+            navigator.clipboard.writeText(url).then(() => {
+                Swal.fire({
+                    position: "center",
+                    icon: "success",
+                    title: "XRay URL copied!",
+                    showConfirmButton: false,
+                    timer: 1500
+                });
+            }).catch(() => {
+                Swal.fire({
+                    position: "center",
+                    icon: "error",
+                    title: "Failed to copy!",
+                    showConfirmButton: false,
+                    timer: 1500
+                });
+            });
+        },
         deleteConfig() {
             if (this.config.profile === '--- Empty ---') return
             Swal.fire({
