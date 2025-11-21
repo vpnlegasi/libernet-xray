@@ -171,6 +171,18 @@
                                         </select>
                                     </div>
                                 </div>
+                                <div class="form-row pt-lg-2 pb-lg-2">
+                                    <div class="col">
+                                        <label>Import VLESS from URL</label>
+                                        <div class="d-flex">
+                                            <input type="text" class="form-control mr-1"
+                                                   placeholder="vless://xxxx"
+                                                   v-model="config.temp.modes[1].import_url">
+                                            <button type="button" class="btn btn-primary ml-1"
+                                                    @click="importVlessConfig">Import</button>
+                                        </div>
+                                    </div>
+                                </div>
                                 <div v-if="config.temp.modes[1].profile.protocol === 'vless'" class="form-row pb-lg-2 xray-vless">
                                     <div class="col-md-8">
                                         <label>VLESS ID</label>

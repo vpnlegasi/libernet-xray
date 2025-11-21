@@ -627,7 +627,6 @@ const app = new Vue({
                             }
                         }
                     }
-
                     break
                 case 2:
                     config = this.config.temp.modes[2].profile
@@ -699,6 +698,33 @@ const app = new Vue({
                     break
             }
             this.resolveServerHost()
+        },
+        importVlessConfig() {
+            const profile = this.config.temp.modes[1].profile
+            const url = this.config.temp.modes[1].import_url
+            profile.protocol = "vless"
+            const raw = url.replace("vless://", "")
+            const [userPart, serverPart] = raw.split("@")
+            profile.server.user.vless.id = userPart
+            const nameMatch = url.match(/#(.+)$/)
+            if(nameMatch) {
+                        this.config.temp.profile = decodeURIComponent(nameMatch[1])
+            } else {
+                this.config.temp.profile = "vless_imported"
+            }
+            const [hostPart, queryPart] = serverPart.split("?")
+            const [host, port] = hostPart.split(":")
+            const params = new URLSearchParams(queryPart)
+            profile.server.host = host
+            profile.server.port = parseInt(port) || 443
+            profile.network = params.get("type") || "tcp"
+            profile.security = params.get("security") || "none"
+            profile.stream.sni = params.get("sni") || ""
+            profile.stream.path = params.get("path") || ""
+            profile.httpupgrade.host = params.get("host") || ""
+            profile.httpupgrade.path = params.get("path") || ""
+            this.resolveServerHost()
+            this.saveConfig()
         },
         importTrojanConfig() {
             const profile = this.config.temp.modes[3].profile
