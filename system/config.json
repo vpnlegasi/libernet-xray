@@ -6,7 +6,7 @@
         "mode": 0,
         "profile": {
             "ssh": "",
-            "v2ray": "",
+            "xray": "",
             "ssh_ssl": "",
             "trojan": "",
             "shadowsocks": "",

@@ -125,13 +125,13 @@
                                 </div>
                             </div>
 
-                            <div v-if="config.temp.mode === 1" class="v2ray">
-                                <div v-if="config.temp.modes[1].profile.protocol === 'vmess'" class="form-row pt-lg-2 pb-lg-2 v2ray-vmess">
+                            <div v-if="config.temp.mode === 1" class="xray">
+                                <div v-if="config.temp.modes[1].profile.protocol === 'vmess'" class="form-row pt-lg-2 pb-lg-2 xray-vmess">
                                     <div class="col">
                                         <label>Import VMess from URL</label>
                                         <div class="d-flex">
                                             <input type="text" class="form-control mr-1" placeholder="vmess://xxxxxxxxxxxx" v-model="config.temp.modes[1].import_url">
-                                            <button type="button" class="btn btn-primary ml-1" @click="importV2rayConfig">Import</button>
+                                            <button type="button" class="btn btn-primary ml-1" @click="importxrayConfig">Import</button>
                                         </div>
                                     </div>
                                 </div>
@@ -153,13 +153,13 @@
                                         <input type="number" class="form-control" placeholder="7300" v-model.number="config.temp.modes[1].profile.etc.udpgw.port" required>
                                     </div>
                                 </div>
-                                <div v-if="config.temp.modes[1].profile.protocol === 'trojan'" class="form-row pb-lg-2 v2ray-trojan">
+                                <div v-if="config.temp.modes[1].profile.protocol === 'trojan'" class="form-row pb-lg-2 xray-trojan">
                                     <div class="col-md-6">
                                         <label>Trojan Password</label>
                                         <input type="text" class="form-control" placeholder="StrongPassword" v-model="config.temp.modes[1].profile.server.user.trojan.password" required>
                                     </div>
                                 </div>
-                                <div v-if="config.temp.modes[1].profile.protocol === 'vmess'" class="form-row pb-lg-2 v2ray-vmess">
+                                <div v-if="config.temp.modes[1].profile.protocol === 'vmess'" class="form-row pb-lg-2 xray-vmess">
                                     <div class="col-md-8">
                                         <label>VMess ID</label>
                                         <input type="text" class="form-control" placeholder="900c42c7-a23d-46dd-a1a0-72c37edf8a03" v-model="config.temp.modes[1].profile.server.user.vmess.id" required>
@@ -171,7 +171,7 @@
                                         </select>
                                     </div>
                                 </div>
-                                <div v-if="config.temp.modes[1].profile.protocol === 'vless'" class="form-row pb-lg-2 v2ray-vless">
+                                <div v-if="config.temp.modes[1].profile.protocol === 'vless'" class="form-row pb-lg-2 xray-vless">
                                     <div class="col-md-8">
                                         <label>VLESS ID</label>
                                         <input type="text" class="form-control" placeholder="900c42c7-a23d-46dd-a1a0-72c37edf8a03" v-model="config.temp.modes[1].profile.server.user.vless.id" required>

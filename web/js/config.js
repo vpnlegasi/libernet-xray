@@ -39,7 +39,7 @@ const app = new Vue({
                         },
                         {
                             value: 1,
-                            name: "V2Ray",
+                            name: "XRay",
                             protocols: [
                                 {
                                     name: "VMess",
@@ -304,7 +304,7 @@ const app = new Vue({
                     action = "get_ssh_configs"
                     break
                 case 1:
-                    action = "get_v2ray_configs"
+                    action = "get_xray_configs"
                     break
                 case 2:
                     action = "get_sshl_configs"
@@ -342,7 +342,7 @@ const app = new Vue({
                         this.getSshConfig()
                         break
                     case 1:
-                        this.getV2rayConfig()
+                        this.getxrayConfig()
                         break
                     case 2:
                         this.getSshSslConfig()
@@ -408,9 +408,9 @@ const app = new Vue({
                 temp.modes[0].profile = res.data.data
             })
         },
-        getV2rayConfig() {
+        getxrayConfig() {
             axios.post('api.php', {
-                action: "get_v2ray_config",
+                action: "get_xray_config",
                 profile: this.config.profile
             }).then((res) => {
                 const temp = this.config.temp
@@ -593,7 +593,41 @@ const app = new Vue({
                     break
                 case 1:
                     config = this.config.temp.modes[1].profile
-                    title = "V2Ray config has been saved"
+                    title = "XRay config has been saved"
+                    if (config.streamSettings) {
+                        const net = config.streamSettings.network
+                        if (net === "ws") {
+                            if (config.http) {
+                                config.http.host = ""
+                                config.http.path = ""
+                            }
+                            if (config.httpupgrade) {
+                                config.httpupgrade.host = ""
+                                config.httpupgrade.path = ""
+                            }
+                        }
+                        if (net === "http") {
+                            if (config.ws) {
+                                config.ws.path = ""
+                                config.ws.host = ""
+                            }
+                            if (config.httpupgrade) {
+                                config.httpupgrade.host = ""
+                                config.httpupgrade.path = ""
+                            }
+                        }
+                        if (net === "httpupgrade") {
+                            if (config.ws) {
+                                config.ws.path = ""
+                                config.ws.host = ""
+                            }
+                            if (config.http) {
+                                config.http.host = ""
+                                config.http.path = ""
+                            }
+                        }
+                    }
+
                     break
                 case 2:
                     config = this.config.temp.modes[2].profile
@@ -637,7 +671,7 @@ const app = new Vue({
                 this.getProfiles(this.config.mode)
             })
         },
-        importV2rayConfig() {
+        importxrayConfig() {
             const protocol = this.config.temp.modes[1].profile.protocol
             const importUrl = this.config.temp.modes[1].import_url
             const config = JSON.parse(atob(importUrl.split("://")[1]))
@@ -715,7 +749,7 @@ const app = new Vue({
                         this.config.temp.modes[0].profile.ip = res.data.data[0]
                     })
                     break
-                // v2ray
+                // xray
                 case 1:
                     axios.post('api.php', {
                         action: 'resolve_host',

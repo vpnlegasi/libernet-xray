@@ -82,7 +82,7 @@ function ssh_service() {
 }
 
 function xray_service() {
-  "${LIBERNET_DIR}/bin/v2ray.sh" -r
+  "${LIBERNET_DIR}/bin/xray.sh" -r
   check_connection
   run_other_services
 }
@@ -199,7 +199,7 @@ function stop_services() {
       "${LIBERNET_DIR}/bin/ssh.sh" -s
       ;;
     "1")
-      "${LIBERNET_DIR}/bin/v2ray.sh" -s
+      "${LIBERNET_DIR}/bin/xray.sh" -s
       ;;
     "2")
       "${LIBERNET_DIR}/bin/ssh-ssl.sh" -s

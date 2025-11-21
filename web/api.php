@@ -42,7 +42,7 @@
         json_response($data);
     }
 
-    function set_v2ray_config($config, $protocol, $network, $security, $sni, $path, $ip, $udpgw_ip, $udpgw_port) {
+    function set_xray_config($config, $protocol, $network, $security, $sni, $path, $ip, $udpgw_ip, $udpgw_port) {
         $config->outbounds[0]->protocol = $protocol;
         $config->outbounds[0]->streamSettings->network = $network;
         $config->outbounds[0]->streamSettings->security = $security;
@@ -97,9 +97,9 @@
                 $profile = $json['profile'];
                 get_config('ssh_ssl', $profile);
                 break;
-            case 'get_v2ray_config':
+            case 'get_xray_config':
                 $profile = $json['profile'];
-                get_config('v2ray', $profile);
+                get_config('xray', $profile);
                 break;
             case 'get_trojan_config':
                 $profile = $json['profile'];
@@ -117,8 +117,8 @@
                 $profile = $json['profile'];
                 get_config('ssh_ws_cdn', $profile);
                 break;
-            case 'get_v2ray_configs':
-                get_profiles('v2ray');
+            case 'get_xray_configs':
+                get_profiles('xray');
                 break;
             case 'get_ssh_configs':
                 get_profiles('ssh');
@@ -183,7 +183,7 @@
                             file_put_contents($libernet_dir.'/bin/config/ssh/'.$profile.'.json', json_encode($config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
                             json_response('SSH config saved');
                             break;
-                        // v2ray
+                        // xray
                         case 1:
                             $protocol = $config['protocol'];
                             $network = $config['network'];
@@ -207,7 +207,7 @@
                             switch ($protocol) {
                                 // vmess
                                 case "vmess":
-                                    $vmess_config = file_get_contents($libernet_dir.'/bin/config/v2ray/templates/vmess.json');
+                                    $vmess_config = file_get_contents($libernet_dir.'/bin/config/xray/templates/vmess.json');
                                     $vmess_config = json_decode($vmess_config);
                                     $vmess_config->outbounds[0]->settings->vnext[0]->address = $host;
                                     $vmess_config->outbounds[0]->settings->vnext[0]->port = $port;
@@ -215,33 +215,33 @@
                                     $vmess_config->outbounds[0]->settings->vnext[0]->users[0]->alterId = $user_level;
                                     $vmess_config->outbounds[0]->settings->vnext[0]->users[0]->id = $vmess_id;
                                     $vmess_config->outbounds[0]->settings->vnext[0]->users[0]->security = $vmess_security;
-                                    set_v2ray_config($vmess_config, $protocol, $network, $security, $sni, $path, $ip, $udpgw_ip, $udpgw_port);
-                                    file_put_contents($libernet_dir.'/bin/config/v2ray/'.$profile.'.json', json_encode($vmess_config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-                                    json_response('V2Ray vmess config saved');
+                                    set_xray_config($vmess_config, $protocol, $network, $security, $sni, $path, $ip, $udpgw_ip, $udpgw_port);
+                                    file_put_contents($libernet_dir.'/bin/config/xray/'.$profile.'.json', json_encode($vmess_config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+                                    json_response('xray vmess config saved');
                                     break;
                                 // vless
                                 case "vless":
-                                    $vless_config = file_get_contents($libernet_dir.'/bin/config/v2ray/templates/vless.json');
+                                    $vless_config = file_get_contents($libernet_dir.'/bin/config/xray/templates/vless.json');
                                     $vless_config = json_decode($vless_config);
                                     $vless_config->outbounds[0]->settings->vnext[0]->address = $host;
                                     $vless_config->outbounds[0]->settings->vnext[0]->port = $port;
                                     $vless_config->outbounds[0]->settings->vnext[0]->users[0]->level = $user_level;
                                     $vless_config->outbounds[0]->settings->vnext[0]->users[0]->id = $vless_id;
-                                    set_v2ray_config($vless_config, $protocol, $network, $security, $sni, $path, $ip, $udpgw_ip, $udpgw_port);
-                                    file_put_contents($libernet_dir.'/bin/config/v2ray/'.$profile.'.json', json_encode($vless_config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-                                    json_response('V2Ray vless config saved');
+                                    set_xray_config($vless_config, $protocol, $network, $security, $sni, $path, $ip, $udpgw_ip, $udpgw_port);
+                                    file_put_contents($libernet_dir.'/bin/config/xray/'.$profile.'.json', json_encode($vless_config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+                                    json_response('xray vless config saved');
                                     break;
                                 // trojan
                                 case "trojan":
-                                    $trojan_config = file_get_contents($libernet_dir.'/bin/config/v2ray/templates/trojan.json');
+                                    $trojan_config = file_get_contents($libernet_dir.'/bin/config/xray/templates/trojan.json');
                                     $trojan_config = json_decode($trojan_config);
                                     $trojan_config->outbounds[0]->settings->servers[0]->address = $host;
                                     $trojan_config->outbounds[0]->settings->servers[0]->port = $port;
                                     $trojan_config->outbounds[0]->settings->servers[0]->level = $user_level;
                                     $trojan_config->outbounds[0]->settings->servers[0]->password = $trojan_password;
-                                    set_v2ray_config($trojan_config, $protocol, $network, $security, $sni, $path, $ip, $udpgw_ip, $udpgw_port);
-                                    file_put_contents($libernet_dir.'/bin/config/v2ray/'.$profile.'.json', json_encode($trojan_config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-                                    json_response('V2Ray trojan config saved');
+                                    set_xray_config($trojan_config, $protocol, $network, $security, $sni, $path, $ip, $udpgw_ip, $udpgw_port);
+                                    file_put_contents($libernet_dir.'/bin/config/xray/'.$profile.'.json', json_encode($trojan_config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+                                    json_response('xray trojan config saved');
                                     break;
                             }
                             break;
@@ -336,14 +336,14 @@
                             $system_config->tun2socks->udpgw->ip = $ssh_config->udpgw->ip;
                             $system_config->tun2socks->udpgw->port = $ssh_config->udpgw->port;
                             break;
-                        // v2ray
+                        // xray
                         case 1:
-                            $v2ray_config = file_get_contents($libernet_dir.'/bin/config/v2ray/'.$profile.'.json');
-                            $v2ray_config = json_decode($v2ray_config);
-                            $system_config->tunnel->profile->v2ray = $profile;
-                            $system_config->server = $v2ray_config->etc->ip;
-                            $system_config->tun2socks->udpgw->ip = $v2ray_config->etc->udpgw->ip;
-                            $system_config->tun2socks->udpgw->port = $v2ray_config->etc->udpgw->port;
+                            $xray_config = file_get_contents($libernet_dir.'/bin/config/xray/'.$profile.'.json');
+                            $xray_config = json_decode($xray_config);
+                            $system_config->tunnel->profile->xray = $profile;
+                            $system_config->server = $xray_config->etc->ip;
+                            $system_config->tun2socks->udpgw->ip = $xray_config->etc->udpgw->ip;
+                            $system_config->tun2socks->udpgw->port = $xray_config->etc->udpgw->port;
                             break;
                         // ssh-ssl
                         case 2:
@@ -412,8 +412,8 @@
                             json_response('SSH config removed');
                             break;
                         case 1:
-                            unlink($libernet_dir.'/bin/config/v2ray/'.$profile.'.json');
-                            json_response('V2Ray config removed');
+                            unlink($libernet_dir.'/bin/config/xray/'.$profile.'.json');
+                            json_response('XRay config removed');
                             break;
                         case 2:
                             unlink($libernet_dir.'/bin/config/ssh_ssl/'.$profile.'.json');

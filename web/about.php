@@ -32,9 +32,9 @@
                                 <li>SSH with proxy</li>
                                 <li>SSH-SSL</li>
                                 <li>SSH-Websocket-CDN</li>
-                                <li>V2Ray VMess</li>
-                                <li>V2Ray VLESS</li>
-                                <li>V2Ray Trojan</li>
+                                <li>XRay VMess</li>
+                                <li>XRay VLESS</li>
+                                <li>XRay Trojan</li>
                                 <li>Trojan</li>
                                 <li>Shadowsocks</li>
                                 <li>OpenVPN</li>

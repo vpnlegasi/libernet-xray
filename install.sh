@@ -332,7 +332,7 @@ function fix_web() {
     "${LIBERNET_DIR}/bin/config/ssh_ws_cdn"
     "${LIBERNET_DIR}/bin/config/stunnel"
     "${LIBERNET_DIR}/bin/config/trojan"
-    "${LIBERNET_DIR}/bin/config/v2ray"
+    "${LIBERNET_DIR}/bin/config/xray"
   )
 
   for dir in "${folders[@]}"; do

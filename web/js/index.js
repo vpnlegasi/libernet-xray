@@ -33,7 +33,7 @@ const app = new Vue({
                         },
                         {
                             value: 1,
-                            name: "V2Ray"
+                            name: "XRay"
                         },
                         {
                             value: 2,
@@ -143,7 +143,7 @@ const app = new Vue({
                     action = "get_ssh_configs"
                     break
                 case 1:
-                    action = "get_v2ray_configs"
+                    action = "get_xray_configs"
                     break
                 case 2:
                     action = "get_sshl_configs"
@@ -269,7 +269,7 @@ const app = new Vue({
                     this.config.profile = res.tunnel.profile.ssh
                     break
                 case 1:
-                    this.config.profile = res.tunnel.profile.v2ray
+                    this.config.profile = res.tunnel.profile.xray
                     break
                 case 2:
                     this.config.profile = res.tunnel.profile.ssh_ssl
