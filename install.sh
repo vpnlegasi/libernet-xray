@@ -21,92 +21,102 @@ function version_lt() {
 }
 
 function fixes_os() {
-    DISTFILE="/etc/opkg/distfeeds.conf"
-    RELEASE_FILE="/etc/openwrt_release"
+  DISTFILE="/etc/opkg/distfeeds.conf"
+  RELEASE_FILE="/etc/openwrt_release"
 
-    # Default to env variables if set
-    ver="${OPENWRT_VER:-}"
-    target_info="${OPENWRT_TARGET_INFO:-}"
-    arch="${OPENWRT_ARCH:-}"
+  # Default to env variables if set
+  ver="${OPENWRT_VER:-}"
+  target_info="${OPENWRT_TARGET_INFO:-}"
+  arch="${OPENWRT_ARCH:-}"
 
-    # Read release file if available
-    if [ -f "$RELEASE_FILE" ]; then
-        : "${ver:=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' "$RELEASE_FILE" | head -n1)}"
-        : "${target_info:=$(grep DISTRIB_TARGET "$RELEASE_FILE" 2>/dev/null | cut -d"'" -f2)}"
-        : "${arch:=$(grep DISTRIB_ARCH "$RELEASE_FILE" 2>/dev/null | cut -d"'" -f2)}"
-    fi
+  # Read release file if available
+  if [ -f "$RELEASE_FILE" ]; then
+    : "${ver:=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' "$RELEASE_FILE" | head -n1)}"
+    : "${target_info:=$(grep DISTRIB_TARGET "$RELEASE_FILE" 2>/dev/null | cut -d"'" -f2)}"
+    : "${arch:=$(grep DISTRIB_ARCH "$RELEASE_FILE" 2>/dev/null | cut -d"'" -f2)}"
+  fi
 
-    # Fallback for snapshot or unknown
-    if [ -z "$ver" ] || [[ "${ver,,}" == *snapshot* ]]; then
-        echo "Detected snapshot/unknown version, fallback to 23.05.3"
-        ver="23.05.3"
-    fi
+  # Fallback for snapshot or unknown (ImmortalWrt)
+  if [ -z "$ver" ] || [[ "${ver,,}" == *snapshot* ]]; then
+    echo "Detected snapshot or unknown version, using fallback 23.05.3"
+    ver="23.05.3"
+  fi
 
-    # Skip legacy fix only for ver >= 23.00
-    if ! version_lt "$ver" "23.00"; then
-        echo "OpenWrt $ver is 23.00 or newer, skipping legacy fixes"
-        return
-    fi
+  # Skip fixes if version >= 23.00
+  if ! version_lt "$ver" "23.00"; then
+    echo "OpenWrt $ver is 23.00 or newer, skipping fixes"
+    return
+  fi
 
-    # Auto detect architecture and board
+  # Determine architecture if target_info missing
+  if [ -z "$target_info" ]; then
     cpu="$(uname -m)"
-    model="$(cat /proc/device-tree/model 2>/dev/null || echo '')"
-
     case "${cpu,,}" in
-        aarch64|arm64)
-            if echo "$model" | grep -qiE 'nanopi|r2s|r4s|rk|rockchip'; then
-                arch="aarch64_cortex-a53"
-                target_info="rockchip/armv8"
-            elif echo "$model" | grep -qi 'rpi'; then
-                arch="aarch64_cortex-a72"
-                target_info="bcm27xx/armv8"
-            else
-                arch="aarch64_generic"
-                target_info="generic/armv8"
-            fi
-            ;;
-        armv7*|armv6*|armhf)
-            arch="arm_cortex-a9_vfpv3-d16"
-            target_info="ramips/mt7621"
-            ;;
-        x86_64)
-            arch="x86_64"
-            target_info="x86/64"
-            ;;
-        i686|i386)
-            arch="x86_generic"
-            target_info="x86/generic"
-            ;;
-        mips*)
-            arch="mips_24kc"
-            target_info="ath79/generic"
-            ;;
-        mipsel*)
-            arch="mipsel_24kc"
-            target_info="ramips/mt7621"
-            ;;
-        *)
-            arch="aarch64_generic"
-            target_info="rockchip/armv8"
-            ;;
+      aarch64|arm64)
+        arch="${arch:-aarch64_generic}"
+        target_info="rockchip/armv8"
+        ;;
+      armv7*|armv6*|armhf)
+        arch="${arch:-arm_cortex-a9_vfpv3-d16}"
+        target_info="ramips/mt7621"
+        ;;
+      x86_64)
+        arch="${arch:-x86_64}"
+        target_info="x86/64"
+        ;;
+      i686|i386)
+        arch="${arch:-x86_generic}"
+        target_info="x86/generic"
+        ;;
+      mips*)
+        arch="${arch:-mips_24kc}"
+        target_info="ath79/generic"
+        ;;
+      mipsel*)
+        arch="${arch:-mipsel_24kc}"
+        target_info="ramips/mt7621"
+        ;;
+      *)
+        arch="${arch:-aarch64_generic}"
+        target_info="rockchip/armv8"
+        ;;
     esac
+  fi
 
-    target="${target_info%%/*}"
-    subtarget="${target_info##*/}"
-    target="${target:-rockchip}"
-    subtarget="${subtarget:-armv8}"
+  target="$(printf '%s' "$target_info" | cut -d'/' -f1)"
+  subtarget="$(printf '%s' "$target_info" | cut -d'/' -f2)"
+  target="${target:-rockchip}"
+  subtarget="${subtarget:-armv8}"
 
-    echo "Regenerating distfeeds.conf for OpenWrt $ver ($arch → $target/$subtarget)"
+  # Special handling for IPQ platform
+  if echo "$target_info" | grep -qiE 'ipq'; then
+    target="qualcommax"
+    case "$target_info" in
+      *ipq807x*|*ipq807*)
+        arch="${arch:-aarch64_cortex-a53}"
+        subtarget="ipq807x"
+        ;;
+      *ipq60*|*ipq60xx*)
+        arch="${arch:-aarch64_cortex-a53}"
+        subtarget="ipq60xx"
+        ;;
+      *)
+        arch="${arch:-aarch64_cortex-a53}"
+        subtarget="${subtarget:-ipq807x}"
+        ;;
+    esac
+  fi
 
-    mirror="https://archive.openwrt.org/releases"
+  echo "Regenerating distfeeds.conf for OpenWrt $ver ($arch → $target/$subtarget)"
 
-    cat > "$DISTFILE" <<EOF
-src/gz openwrt_core ${mirror}/${ver}/targets/${target}/${subtarget}/packages
-src/gz openwrt_base ${mirror}/${ver}/packages/${arch}/base
-src/gz openwrt_luci ${mirror}/${ver}/packages/${arch}/luci
-src/gz openwrt_packages ${mirror}/${ver}/packages/${arch}/packages
-src/gz openwrt_routing ${mirror}/${ver}/packages/${arch}/routing
-src/gz openwrt_telephony ${mirror}/${ver}/packages/${arch}/telephony
+  # Write distfeeds.conf
+  cat > "$DISTFILE" <<EOF
+src/gz openwrt_core https://downloads.openwrt.org/releases/${ver}/targets/${target}/${subtarget}/packages
+src/gz openwrt_base https://downloads.openwrt.org/releases/${ver}/packages/${arch}/base
+src/gz openwrt_luci https://downloads.openwrt.org/releases/${ver}/packages/${arch}/luci
+src/gz openwrt_packages https://downloads.openwrt.org/releases/${ver}/packages/${arch}/packages
+src/gz openwrt_routing https://downloads.openwrt.org/releases/${ver}/packages/${arch}/routing
+src/gz openwrt_telephony https://downloads.openwrt.org/releases/${ver}/packages/${arch}/telephony
 EOF
 }
 
