@@ -15,3 +15,5 @@ Password - vpnlegasi
 
 #Others
 Add feature auto reconnect loop 1 minute waiting if server down for rebooting
+Add Http Upgrade Protocol
+Add direct paste link Vless - Not tested yet
