@@ -1,2305 +1,1506 @@
 #!/bin/sh
-# Copyright (C) 2018-2020 L-WRT Team
-# Copyright (C) 2021-2025 xiaorouji
 
-. $IPKG_INSTROOT/lib/functions.sh
-. $IPKG_INSTROOT/lib/functions/service.sh
+DIR="$(cd "$(dirname "$0")" && pwd)"
+MY_PATH=$DIR/iptables.sh
+IPSET_LOCAL="passwall_local"
+IPSET_LAN="passwall_lan"
+IPSET_VPS="passwall_vps"
+IPSET_SHUNT="passwall_shunt"
+IPSET_GFW="passwall_gfw"
+IPSET_CHN="passwall_chn"
+IPSET_BLACK="passwall_black"
+IPSET_WHITE="passwall_white"
+IPSET_BLOCK="passwall_block"
 
-CONFIG=passwall
-TMP_PATH=/tmp/etc/$CONFIG
-TMP_BIN_PATH=$TMP_PATH/bin
-TMP_SCRIPT_FUNC_PATH=$TMP_PATH/script_func
-TMP_ROUTE_PATH=$TMP_PATH/route
-TMP_ACL_PATH=$TMP_PATH/acl
-TMP_IFACE_PATH=$TMP_PATH/iface
-TMP_PATH2=/tmp/etc/${CONFIG}_tmp
-GLOBAL_ACL_PATH=${TMP_ACL_PATH}/default
-LOG_FILE=/tmp/log/$CONFIG.log
-APP_PATH=/usr/share/$CONFIG
-RULES_PATH=/usr/share/${CONFIG}/rules
-LUA_UTIL_PATH=/usr/lib/lua/luci/passwall
-UTIL_SINGBOX=$LUA_UTIL_PATH/util_sing-box.lua
-UTIL_SS=$LUA_UTIL_PATH/util_shadowsocks.lua
-UTIL_XRAY=$LUA_UTIL_PATH/util_xray.lua
-UTIL_TROJAN=$LUA_UTIL_PATH/util_trojan.lua
-UTIL_NAIVE=$LUA_UTIL_PATH/util_naiveproxy.lua
-UTIL_HYSTERIA2=$LUA_UTIL_PATH/util_hysteria2.lua
-UTIL_TUIC=$LUA_UTIL_PATH/util_tuic.lua
+IPSET_LOCAL6="passwall_local6"
+IPSET_LAN6="passwall_lan6"
+IPSET_VPS6="passwall_vps6"
+IPSET_SHUNT6="passwall_shunt6"
+IPSET_GFW6="passwall_gfw6"
+IPSET_CHN6="passwall_chn6"
+IPSET_BLACK6="passwall_black6"
+IPSET_WHITE6="passwall_white6"
+IPSET_BLOCK6="passwall_block6"
 
-echolog() {
-	local d="$(date "+%Y-%m-%d %H:%M:%S")"
-	echo -e "$d: $*" >>$LOG_FILE
+FORCE_INDEX=2
+
+USE_SHUNT_TCP=0
+USE_SHUNT_UDP=0
+
+. /lib/functions/network.sh
+
+ipt=$(command -v iptables-legacy || command -v iptables)
+ip6t=$(command -v ip6tables-legacy || command -v ip6tables)
+
+ipt_n="$ipt -t nat -w"
+ipt_m="$ipt -t mangle -w"
+ip6t_n="$ip6t -t nat -w"
+ip6t_m="$ip6t -t mangle -w"
+[ -z "$ip6t" -o -z "$(lsmod | grep 'ip6table_nat')" ] && ip6t_n="eval #$ip6t_n"
+[ -z "$ip6t" -o -z "$(lsmod | grep 'ip6table_mangle')" ] && ip6t_m="eval #$ip6t_m"
+FWI=$(uci -q get firewall.passwall.path 2>/dev/null)
+FAKE_IP="198.18.0.0/15"
+FAKE_IP_6="fc00::/18"
+
+factor() {
+	if [ -z "$1" ] || [ -z "$2" ]; then
+		echo ""
+	elif [ "$1" == "1:65535" ]; then
+		echo ""
+	else
+		echo "$2 $1"
+	fi
 }
 
-config_get_type() {
-	local ret=$(uci -q get "${CONFIG}.${1}" 2>/dev/null)
-	echo "${ret:=$2}"
+dst() {
+	echo "-m set $2 --match-set $1 dst"
 }
 
-config_n_get() {
-	local ret=$(uci -q get "${CONFIG}.${1}.${2}" 2>/dev/null)
-	echo "${ret:=$3}"
+comment() {
+	local name=$(echo $1 | sed 's/ /_/g')
+	echo "-m comment --comment '$name'"
 }
 
-config_t_get() {
-	local index=${4:-0}
-	local ret=$(uci -q get "${CONFIG}.@${1}[${index}].${2}" 2>/dev/null)
-	echo "${ret:=${3}}"
-}
-
-config_t_set() {
-	local index=${4:-0}
-	local ret=$(uci -q set "${CONFIG}.@${1}[${index}].${2}=${3}" 2>/dev/null)
-}
-
-get_enabled_anonymous_secs() {
-	uci -q show "${CONFIG}" | grep "${1}\[.*\.enabled='1'" | cut -d '.' -sf2
-}
-
-get_host_ip() {
-	local host=$2
-	local count=$3
-	[ -z "$count" ] && count=3
-	local isip=""
-	local ip=$host
-	if [ "$1" == "ipv6" ]; then
-		isip=$(echo $host | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}")
-		if [ -n "$isip" ]; then
-			isip=$(echo $host | cut -d '[' -f2 | cut -d ']' -f1)
+#解决端口超过15个ipt无效，支持单端口、端口范围
+add_port_rules() {
+	local ipt_cmd="$1"
+	local port_list="$2"
+	local target="$3"
+	echo "$port_list" | grep -vq '[0-9]' && return
+	port_list=$(echo "$port_list" | tr -d ' ' | sed 's/-/:/g' | tr ',' '\n' | awk '!a[$0]++' | grep -v '^$')
+	[ -z "$port_list" ] && return
+	if echo "$port_list" | grep -q '^1:65535$'; then
+		eval "$ipt_cmd $target"
+		return
+	fi
+	local multiport_ports=""
+	local range_ports=""
+	local count=0
+	local port
+	for port in $port_list; do
+		if echo "$port" | grep -q ':'; then
+			range_ports="$range_ports $port"
+		else
+			multiport_ports="$multiport_ports,$port"
+			count=$((count + 1))
+			if [ "$count" -eq 15 ]; then
+				eval "$ipt_cmd -m multiport --dport ${multiport_ports#,} $target"
+				multiport_ports=""
+				count=0
+			fi
 		fi
-	else
-		isip=$(echo $host | grep -E "([0-9]{1,3}[\.]){3}[0-9]{1,3}")
+	done
+	if [ -n "$multiport_ports" ]; then
+		eval "$ipt_cmd -m multiport --dport ${multiport_ports#,} $target"
 	fi
-	[ -z "$isip" ] && {
-		local t=4
-		[ "$1" == "ipv6" ] && t=6
-		local vpsrip=$(resolveip -$t -t $count $host | awk 'NR==1{print}')
-		ip=$vpsrip
-	}
-	echo $ip
-}
-
-get_node_host_ip() {
-	local ip
-	local address=$(config_n_get $1 address)
-	[ -n "$address" ] && {
-		local use_ipv6=$(config_n_get $1 use_ipv6)
-		local network_type="ipv4"
-		[ "$use_ipv6" == "1" ] && network_type="ipv6"
-		ip=$(get_host_ip $network_type $address)
-	}
-	echo $ip
-}
-
-get_ip_port_from() {
-	local __host=${1}; shift 1
-	local __ipv=${1}; shift 1
-	local __portv=${1}; shift 1
-	local __ucipriority=${1}; shift 1
-
-	local val1 val2
-	val2=$(echo "$__host" | sed -n '
-		s/^[^#]*[#]\([0-9]*\)$/\1/p; t;
-		s/^\(\[[^]]*\]\)[:]\([0-9]*\)$/\2/p; t;
-		s/^.*[:#]\([0-9]*\)$/\1/p
-	')
-	if [ -n "${__ucipriority}" ]; then
-		val2=$(config_n_get ${__host} port "${val2}")
-		val1=$(config_n_get ${__host} address "${__host%%${val2:+[:#]${val2}*}}")
-	else
-		val1="${__host%%${val2:+[:#]${val2}*}}"
-	fi
-	eval "${__ipv}=\"$val1\"; ${__portv}=\"$val2\""
-}
-
-host_from_url(){
-	local f=${1}
-
-	## Remove protocol part of url  ##
-	f="${f##http://}"
-	f="${f##https://}"
-	f="${f##ftp://}"
-	f="${f##sftp://}"
-
-	## Remove username and/or username:password part of URL  ##
-	f="${f##*:*@}"
-	f="${f##*@}"
-
-	## Remove rest of urls ##
-	f="${f%%/*}"
-	echo "${f%%:*}"
-}
-
-hosts_foreach() {
-	local __hosts
-	eval "__hosts=\$${1}"; shift 1
-	local __func=${1}; shift 1
-	local __default_port=${1}; shift 1
-	local __ret=1
-
-	[ -z "${__hosts}" ] && return 0
-	local __ip __port
-	for __host in $(echo $__hosts | sed 's/[ ,]/\n/g'); do
-		get_ip_port_from "$__host" "__ip" "__port"
-		eval "$__func \"${__host}\" \"\${__ip}\" \"\${__port:-${__default_port}}\" \"$@\""
-		__ret=$?
-		[ ${__ret} -ge ${ERROR_NO_CATCH:-1} ] && return ${__ret}
+	for port in $range_ports; do
+		eval "$ipt_cmd --dport $port $target"
 	done
 }
 
-check_host() {
-	local f=${1}
-	a=$(echo $f | grep "\/")
-	[ -n "$a" ] && return 1
-	# Check if it contains Chinese characters
-	local tmp=$(echo -n $f | awk '{print gensub(/[!-~]/,"","g",$0)}')
-	[ -n "$tmp" ] && return 1
+destroy_ipset() {
+	for i in "$@"; do
+		ipset -q -F $i
+		ipset -q -X $i
+	done
+}
+
+insert_rule_before() {
+	[ $# -ge 3 ] || {
+		return 1
+	}
+	local ipt_tmp="${1}"; shift
+	local chain="${1}"; shift
+	local keyword="${1}"; shift
+	local rule="${1}"; shift
+	local default_index="${1}"; shift
+	default_index=${default_index:-0}
+	local _index=$($ipt_tmp -n -L $chain --line-numbers 2>/dev/null | grep "$keyword" | head -n 1 | awk '{print $1}')
+	if [ -z "${_index}" ] && [ "${default_index}" = "0" ]; then
+		$ipt_tmp -A $chain $rule
+	else
+		if [ -z "${_index}" ]; then
+			_index=${default_index}
+		fi
+		$ipt_tmp -I $chain $_index $rule
+	fi
+}
+
+insert_rule_after() {
+	[ $# -ge 3 ] || {
+		return 1
+	}
+	local ipt_tmp="${1}"; shift
+	local chain="${1}"; shift
+	local keyword="${1}"; shift
+	local rule="${1}"; shift
+	local default_index="${1}"; shift
+	default_index=${default_index:-0}
+	local _index=$($ipt_tmp -n -L $chain --line-numbers 2>/dev/null | grep "$keyword" | awk 'END {print}' | awk '{print $1}')
+	if [ -z "${_index}" ] && [ "${default_index}" = "0" ]; then
+		$ipt_tmp -A $chain $rule
+	else
+		if [ -n "${_index}" ]; then
+			_index=$((_index + 1))
+		else
+			_index=${default_index}
+		fi
+		$ipt_tmp -I $chain $_index $rule
+	fi
+}
+
+RULE_LAST_INDEX() {
+	[ $# -ge 3 ] || {
+		echolog "索引列举方式不正确（iptables），终止执行！"
+		return 1
+	}
+	local ipt_tmp="${1}"; shift
+	local chain="${1}"; shift
+	local list="${1}"; shift
+	local default="${1:-0}"; shift
+	local _index=$($ipt_tmp -n -L $chain --line-numbers 2>/dev/null | grep "$list" | head -n 1 | awk '{print $1}')
+	echo "${_index:-${default}}"
+}
+
+REDIRECT() {
+	local s="-j REDIRECT"
+	if [ -n "$1" ]; then
+		s="$s --to-ports $1"
+		if [ "$2" = "MARK" ]; then
+			s="-j MARK --set-mark $1"
+		elif [ "$2" = "TPROXY" ]; then
+			local mark="-m mark --mark 1"
+			s="${mark} -j TPROXY --tproxy-mark 1/1 --on-port $1"
+		fi
+	fi
+	echo "$s"
+}
+
+get_jump_ipt() {
+	case "$1" in
+	direct)
+		local mark="-m mark ! --mark 1"
+		s="${mark} -j RETURN"
+		echo $s
+		;;
+	proxy)
+		if [ -n "$2" ] && [ -n "$(echo $2 | grep "^-")" ]; then
+			echo "$2"
+		else
+			echo "$(REDIRECT $2 $3)"
+		fi
+		;;
+	esac
+}
+
+gen_lanlist() {
+	cat $RULES_PATH/lanlist_ipv4 | tr -s '\n' | grep -v "^#"
+}
+
+gen_lanlist_6() {
+	cat $RULES_PATH/lanlist_ipv6 | tr -s '\n' | grep -v "^#"
+}
+
+get_wan_ip() {
+	local NET_IF
+	local NET_ADDR
+	
+	network_flush_cache
+	network_find_wan NET_IF
+	network_get_ipaddr NET_ADDR "${NET_IF}"
+	
+	echo $NET_ADDR
+}
+
+get_wan6_ip() {
+	local NET_IF
+	local NET_ADDR
+	
+	network_flush_cache
+	network_find_wan6 NET_IF
+	network_get_ipaddr6 NET_ADDR "${NET_IF}"
+	
+	echo $NET_ADDR
+}
+
+load_acl() {
+	([ "$ENABLED_ACLS" == 1 ] || ([ "$ENABLED_DEFAULT_ACL" == 1 ] && [ "$CLIENT_PROXY" == 1 ])) && echolog "  - 访问控制："
+	[ "$ENABLED_ACLS" == 1 ] && {
+		acl_app
+		for sid in $(ls -F ${TMP_ACL_PATH} | grep '/$' | awk -F '/' '{print $1}' | grep -v 'default'); do
+			eval $(uci -q show "${CONFIG}.${sid}" | cut -d'.' -sf 3-)
+
+			tcp_no_redir_ports=${tcp_no_redir_ports:-default}
+			udp_no_redir_ports=${udp_no_redir_ports:-default}
+			use_global_config=${use_global_config:-0}
+			tcp_proxy_drop_ports=${tcp_proxy_drop_ports:-default}
+			udp_proxy_drop_ports=${udp_proxy_drop_ports:-default}
+			tcp_redir_ports=${tcp_redir_ports:-default}
+			udp_redir_ports=${udp_redir_ports:-default}
+			use_direct_list=${use_direct_list:-1}
+			use_proxy_list=${use_proxy_list:-1}
+			use_block_list=${use_block_list:-1}
+			use_gfw_list=${use_gfw_list:-1}
+			chn_list=${chn_list:-direct}
+			tcp_proxy_mode=${tcp_proxy_mode:-proxy}
+			udp_proxy_mode=${udp_proxy_mode:-proxy}
+			[ "$tcp_no_redir_ports" = "default" ] && tcp_no_redir_ports=$TCP_NO_REDIR_PORTS
+			[ "$udp_no_redir_ports" = "default" ] && udp_no_redir_ports=$UDP_NO_REDIR_PORTS
+			[ "$tcp_proxy_drop_ports" = "default" ] && tcp_proxy_drop_ports=$TCP_PROXY_DROP_PORTS
+			[ "$udp_proxy_drop_ports" = "default" ] && udp_proxy_drop_ports=$UDP_PROXY_DROP_PORTS
+			[ "$tcp_redir_ports" = "default" ] && tcp_redir_ports=$TCP_REDIR_PORTS
+			[ "$udp_redir_ports" = "default" ] && udp_redir_ports=$UDP_REDIR_PORTS
+
+			[ -n "$(get_cache_var "ACL_${sid}_tcp_node")" ] && tcp_node=$(get_cache_var "ACL_${sid}_tcp_node")
+			[ -n "$(get_cache_var "ACL_${sid}_tcp_redir_port")" ] && tcp_port=$(get_cache_var "ACL_${sid}_tcp_redir_port")
+			[ -n "$(get_cache_var "ACL_${sid}_udp_node")" ] && udp_node=$(get_cache_var "ACL_${sid}_udp_node")
+			[ -n "$(get_cache_var "ACL_${sid}_udp_redir_port")" ] && udp_port=$(get_cache_var "ACL_${sid}_udp_redir_port")
+			[ -n "$(get_cache_var "ACL_${sid}_dns_port")" ] && dns_redirect_port=$(get_cache_var "ACL_${sid}_dns_port")
+			[ -n "$tcp_node" ] && tcp_node_remark=$(config_n_get $tcp_node remarks)
+			[ -n "$udp_node" ] && udp_node_remark=$(config_n_get $udp_node remarks)
+
+			use_shunt_tcp=0
+			use_shunt_udp=0
+			[ -n "$tcp_node" ] && [ "$(config_n_get $tcp_node protocol)" = "_shunt" ] && use_shunt_tcp=1
+			[ -n "$udp_node" ] && [ "$(config_n_get $udp_node protocol)" = "_shunt" ] && use_shunt_udp=1
+
+			[ "${use_global_config}" = "1" ] && {
+				tcp_node_remark=$(config_n_get $TCP_NODE remarks)
+				udp_node_remark=$(config_n_get $UDP_NODE remarks)
+				use_direct_list=${USE_DIRECT_LIST}
+				use_proxy_list=${USE_PROXY_LIST}
+				use_block_list=${USE_BLOCK_LIST}
+				use_gfw_list=${USE_GFW_LIST}
+				chn_list=${CHN_LIST}
+				tcp_proxy_mode=${TCP_PROXY_MODE}
+				udp_proxy_mode=${UDP_PROXY_MODE}
+				use_shunt_tcp=${USE_SHUNT_TCP}
+				use_shunt_udp=${USE_SHUNT_UDP}
+				dns_redirect_port=${DNS_REDIRECT_PORT}
+				black_set_name=${IPSET_BLACK}
+				black6_set_name=${IPSET_BLACK6}
+				gfw_set_name=${IPSET_GFW}
+				gfw6_set_name=${IPSET_GFW6}
+				shunt_set_name=${IPSET_SHUNT}
+				shunt6_set_name=${IPSET_SHUNT6}
+			}
+
+			_acl_list=${TMP_ACL_PATH}/${sid}/source_list
+
+			for i in $(cat $_acl_list); do
+				local _ipt_source _ipv4
+				local msg
+				if [ -n "${interface}" ]; then
+					. /lib/functions/network.sh
+					local gateway device
+					network_get_gateway gateway "${interface}"
+					network_get_device device "${interface}"
+					[ -z "${device}" ] && device="${interface}"
+					_ipt_source="-i ${device} "
+					msg="源接口【${device}】，"
+				else
+					msg="源接口【所有】，"
+				fi
+				if [ -n "$(echo ${i} | grep '^iprange:')" ]; then
+					_iprange=$(echo ${i} | sed 's#iprange:##g')
+					_ipt_source=$(factor ${_iprange} "${_ipt_source}-m iprange --src-range")
+					msg="${msg}IP range【${_iprange}】，"
+					_ipv4="1"
+					unset _iprange
+				elif [ -n "$(echo ${i} | grep '^ipset:')" ]; then
+					_ipset=$(echo ${i} | sed 's#ipset:##g')
+					msg="${msg}IPset【${_ipset}】，"
+					ipset -q list ${_ipset} >/dev/null
+					if [ $? -eq 0 ]; then
+						_ipt_source="${_ipt_source}-m set --match-set ${_ipset} src"
+						unset _ipset
+					else
+						echolog "  - 【$remarks】，${msg}不存在，忽略。"
+						unset _ipset
+						continue
+					fi
+				elif [ -n "$(echo ${i} | grep '^ip:')" ]; then
+					_ip=$(echo ${i} | sed 's#ip:##g')
+					_ipt_source=$(factor ${_ip} "${_ipt_source}-s")
+					msg="${msg}IP【${_ip}】，"
+					_ipv4="1"
+					unset _ip
+				elif [ -n "$(echo ${i} | grep '^mac:')" ]; then
+					_mac=$(echo ${i} | sed 's#mac:##g')
+					_ipt_source=$(factor ${_mac} "${_ipt_source}-m mac --mac-source")
+					msg="${msg}MAC【${_mac}】，"
+					unset _mac
+				elif [ -n "$(echo ${i} | grep '^any')" ]; then
+					msg="${msg}所有设备，"
+				else
+					continue
+				fi
+				msg="【$remarks】，${msg}"
+				
+				ipt_tmp=$ipt_n
+				[ -n "${is_tproxy}" ] && ipt_tmp=$ipt_m
+
+				[ "$tcp_no_redir_ports" != "disable" ] && {
+					if ! has_1_65535 "$tcp_no_redir_ports"; then
+						[ "$_ipv4" != "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") ${_ipt_source} -p tcp" $tcp_no_redir_ports "-j RETURN" 2>/dev/null
+						add_port_rules "$ipt_tmp -A PSW $(comment "$remarks") ${_ipt_source} -p tcp" $tcp_no_redir_ports "-j RETURN"
+						echolog "     - ${msg}不代理 TCP 端口[${tcp_no_redir_ports}]"
+					else
+						#结束时会return，无需加多余的规则。
+						unset tcp_port
+						echolog "     - ${msg}不代理所有 TCP 端口"
+					fi
+				}
+				
+				[ "$udp_no_redir_ports" != "disable" ] && {
+					if ! has_1_65535 "$udp_no_redir_ports"; then
+						[ "$_ipv4" != "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") ${_ipt_source} -p udp" $udp_no_redir_ports "-j RETURN" 2>/dev/null
+						add_port_rules "$ipt_m -A PSW $(comment "$remarks") ${_ipt_source} -p udp" $udp_no_redir_ports "-j RETURN"
+						echolog "     - ${msg}不代理 UDP 端口[${udp_no_redir_ports}]"
+					else
+						#结束时会return，无需加多余的规则。
+						unset udp_port
+						echolog "     - ${msg}不代理所有 UDP 端口"
+					fi
+				}
+				
+				local dns_redirect
+				[ $(config_t_get global dns_redirect "1") = "1" ] && dns_redirect=53
+				if ([ -n "$tcp_port" ] && [ -n "${tcp_proxy_mode}" ]) || ([ -n "$udp_port" ] && [ -n "${udp_proxy_mode}" ]); then
+					[ "${use_proxy_list}" = "1" ] && {
+						[ "${use_global_config}" = "0" ] && {
+							black_set_name="passwall_${sid}_black"
+							black6_set_name="passwall_${sid}_black6"
+							ipset -! create $black_set_name nethash maxelem 1048576 timeout 172800
+							ipset -! create $black6_set_name nethash family inet6 maxelem 1048576 timeout 172800
+						}
+					}
+					[ "${use_gfw_list}" = "1" ] && {
+						[ "${use_global_config}" = "0" ] && {
+							gfw_set_name="passwall_${sid}_gfw"
+							gfw6_set_name="passwall_${sid}_gfw6"
+							ipset -! create $gfw_set_name nethash maxelem 1048576 timeout 172800
+							ipset -! create $gfw6_set_name nethash family inet6 maxelem 1048576 timeout 172800
+						}
+					}
+					[ "${use_shunt_tcp}" = "1" -o "${use_shunt_udp}" = "1" ] && {
+						[ "${use_global_config}" = "0" ] && {
+							shunt_set_name="passwall_${sid}_shunt"
+							shunt6_set_name="passwall_${sid}_shunt6"
+							ipset -! create $shunt_set_name nethash maxelem 1048576 timeout 172800
+							ipset -! create $shunt6_set_name nethash family inet6 maxelem 1048576 timeout 172800
+						}
+					}
+					[ -n "${dns_redirect_port}" ] && dns_redirect=${dns_redirect_port}
+				else
+					[ -n "${DIRECT_DNSMASQ_PORT}" ] && dns_redirect=${DIRECT_DNSMASQ_PORT}
+				fi
+				if [ -n "${dns_redirect}" ]; then
+					$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source} --dport 53 -j RETURN
+					[ "$_ipv4" != "1" ] && $ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source} --dport 53 -j RETURN 2>/dev/null
+					$ipt_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source} --dport 53 -j RETURN
+					[ "$_ipv4" != "1" ] && $ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source} --dport 53 -j RETURN 2>/dev/null
+					$ipt_n -A PSW_DNS $(comment "$remarks") -p udp ${_ipt_source} --dport 53 -j REDIRECT --to-ports ${dns_redirect}
+					[ "$_ipv4" != "1" ] && $ip6t_n -A PSW_DNS $(comment "$remarks") -p udp ${_ipt_source} --dport 53 -j REDIRECT --to-ports ${dns_redirect} 2>/dev/null
+					$ipt_n -A PSW_DNS $(comment "$remarks") -p tcp ${_ipt_source} --dport 53 -j REDIRECT --to-ports ${dns_redirect}
+					[ "$_ipv4" != "1" ] && $ip6t_n -A PSW_DNS $(comment "$remarks") -p tcp ${_ipt_source} --dport 53 -j REDIRECT --to-ports ${dns_redirect} 2>/dev/null
+					[ -z "$(get_cache_var "ACL_${sid}_tcp_default")" ] && echolog "     - ${msg}使用与全局配置不相同节点，已将DNS强制重定向到专用 DNS 服务器。"
+				fi
+
+				[ -n "$tcp_port" -o -n "$udp_port" ] && {
+					[ "${use_block_list}" = "1" ] && $ipt_m -A PSW $(comment "$remarks") ${_ipt_source} $(dst $IPSET_BLOCK) -j DROP
+					[ "${use_direct_list}" = "1" ] && $ipt_tmp -A PSW $(comment "$remarks") ${_ipt_source} $(dst $IPSET_WHITE) -j RETURN
+					[ "$PROXY_IPV6" == "1" ] && [ "$_ipv4" != "1" ] && {
+						[ "${use_block_list}" = "1" ] && $ip6t_m -A PSW $(comment "$remarks") ${_ipt_source} $(dst $IPSET_BLOCK6) -j DROP 2>/dev/null
+						[ "${use_direct_list}" = "1" ] && $ip6t_m -A PSW $(comment "$remarks") ${_ipt_source} $(dst $IPSET_WHITE6) -j RETURN 2>/dev/null
+					}
+
+					[ "$tcp_proxy_drop_ports" != "disable" ] && {
+						[ "$PROXY_IPV6" == "1" ] && [ "$_ipv4" != "1" ] && {
+							add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_proxy_drop_ports "-d $FAKE_IP_6 -j DROP" 2>/dev/null
+							[ "${use_proxy_list}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_proxy_drop_ports "$(dst $black6_set_name) -j DROP" 2>/dev/null
+							[ "${use_gfw_list}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_proxy_drop_ports "$(dst $gfw6_set_name) -j DROP" 2>/dev/null
+							[ "${chn_list}" != "0" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_proxy_drop_ports "$(dst $IPSET_CHN6) $(get_jump_ipt ${chn_list} "-j DROP")" 2>/dev/null
+							[ "${use_shunt_tcp}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_proxy_drop_ports "$(dst $shunt6_set_name) -j DROP" 2>/dev/null
+							[ "${tcp_proxy_mode}" != "disable" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_proxy_drop_ports "-j DROP" 2>/dev/null
+						}
+						add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_proxy_drop_ports "-d $FAKE_IP -j DROP"
+						[ "${use_proxy_list}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_proxy_drop_ports "$(dst $black_set_name) -j DROP"
+						[ "${use_gfw_list}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_proxy_drop_ports "$(dst $gfw_set_name) -j DROP"
+						[ "${chn_list}" != "0" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_proxy_drop_ports "$(dst $IPSET_CHN) $(get_jump_ipt ${chn_list} "-j DROP")"
+						[ "${use_shunt_tcp}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_proxy_drop_ports "$(dst $shunt_set_name) -j DROP"
+						[ "${tcp_proxy_mode}" != "disable" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_proxy_drop_ports "-j DROP"
+						echolog "     - ${msg}屏蔽代理 TCP 端口[${tcp_proxy_drop_ports}]"
+					}
+
+					[ "$udp_proxy_drop_ports" != "disable" ] && {
+						[ "$PROXY_IPV6" == "1" ] && [ "$_ipv4" != "1" ] && {
+							add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_proxy_drop_ports "-d $FAKE_IP_6 -j DROP" 2>/dev/null
+							[ "${use_proxy_list}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_proxy_drop_ports "$(dst $black6_set_name) -j DROP" 2>/dev/null
+							[ "${use_gfw_list}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_proxy_drop_ports "$(dst $gfw6_set_name) -j DROP" 2>/dev/null
+							[ "${chn_list}" != "0" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_proxy_drop_ports "$(dst $IPSET_CHN6) $(get_jump_ipt ${chn_list} "-j DROP")" 2>/dev/null
+							[ "${use_shunt_udp}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_proxy_drop_ports "$(dst $shunt6_set_name) -j DROP" 2>/dev/null
+							[ "${udp_proxy_mode}" != "disable" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_proxy_drop_ports "-j DROP" 2>/dev/null
+						}
+						add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_proxy_drop_ports "-d $FAKE_IP -j DROP"
+						[ "${use_proxy_list}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_proxy_drop_ports "$(dst $black_set_name) -j DROP"
+						[ "${use_gfw_list}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_proxy_drop_ports "$(dst $gfw_set_name) -j DROP"
+						[ "${chn_list}" != "0" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_proxy_drop_ports "$(dst $IPSET_CHN) $(get_jump_ipt ${chn_list} "-j DROP")"
+						[ "${use_shunt_udp}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_proxy_drop_ports "$(dst $shunt_set_name) -j DROP"
+						[ "${udp_proxy_mode}" != "disable" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_proxy_drop_ports "-j DROP"
+						echolog "     - ${msg}屏蔽代理 UDP 端口[${udp_proxy_drop_ports}]"
+					}
+				}
+				
+				[ -n "$tcp_port" ] && {
+					if [ -n "${tcp_proxy_mode}" ]; then
+						msg2="${msg}使用 TCP 节点[$tcp_node_remark]"
+						if [ -n "${is_tproxy}" ]; then
+							msg2="${msg2}(TPROXY:${tcp_port})"
+							ipt_tmp=$ipt_m
+							ipt_j="-j PSW_RULE"
+						else
+							msg2="${msg2}(REDIRECT:${tcp_port})"
+							ipt_j="$(REDIRECT $tcp_port)"
+						fi
+						
+						[ "$accept_icmp" = "1" ] && {
+							$ipt_n -A PSW $(comment "$remarks") -p icmp ${_ipt_source} -d $FAKE_IP $(REDIRECT)
+							[ "${use_proxy_list}" = "1" ] && $ipt_n -A PSW $(comment "$remarks") -p icmp ${_ipt_source} $(dst $black_set_name) $(REDIRECT)
+							[ "${use_gfw_list}" = "1" ] && $ipt_n -A PSW $(comment "$remarks") -p icmp ${_ipt_source} $(dst $gfw_set_name) $(REDIRECT)
+							[ "${chn_list}" != "0" ] && $ipt_n -A PSW $(comment "$remarks") -p icmp ${_ipt_source} $(dst $IPSET_CHN) $(get_jump_ipt ${chn_list})
+							[ "${use_shunt_tcp}" = "1" ] && $ipt_n -A PSW $(comment "$remarks") -p icmp ${_ipt_source} $(dst $shunt_set_name) $(REDIRECT)
+							[ "${tcp_proxy_mode}" != "disable" ] && $ipt_n -A PSW $(comment "$remarks") -p icmp ${_ipt_source} $(REDIRECT)
+						}
+						
+						[ "$accept_icmpv6" = "1" ] && [ "$PROXY_IPV6" == "1" ] && [ "$_ipv4" != "1" ] && {
+							$ip6t_n -A PSW $(comment "$remarks") -p ipv6-icmp ${_ipt_source} -d $FAKE_IP_6 $(REDIRECT) 2>/dev/null
+							[ "${use_proxy_list}" = "1" ] && $ip6t_n -A PSW $(comment "$remarks") -p ipv6-icmp ${_ipt_source} $(dst $black6_set_name) $(REDIRECT) 2>/dev/null
+							[ "${use_gfw_list}" = "1" ] && $ip6t_n -A PSW $(comment "$remarks") -p ipv6-icmp ${_ipt_source} $(dst $gfw6_set_name) $(REDIRECT) 2>/dev/null
+							[ "${chn_list}" != "0" ] && $ip6t_n -A PSW $(comment "$remarks") -p ipv6-icmp ${_ipt_source} $(dst $IPSET_CHN6) $(get_jump_ipt ${chn_list}) 2>/dev/null
+							[ "${use_shunt_tcp}" = "1" ] && $ip6t_n -A PSW $(comment "$remarks") -p ipv6-icmp ${_ipt_source} $(dst $shunt6_set_name) $(REDIRECT) 2>/dev/null
+							[ "${tcp_proxy_mode}" != "disable" ] && $ip6t_n -A PSW $(comment "$remarks") -p ipv6-icmp ${_ipt_source} $(REDIRECT) 2>/dev/null
+						}
+
+						$ipt_tmp -A PSW $(comment "$remarks") -p tcp ${_ipt_source} -d $FAKE_IP ${ipt_j}
+						[ "${use_proxy_list}" = "1" ] && add_port_rules "$ipt_tmp -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_redir_ports "$(dst $black_set_name) ${ipt_j}"
+						[ "${use_gfw_list}" = "1" ] && add_port_rules "$ipt_tmp -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_redir_ports "$(dst $gfw_set_name) ${ipt_j}"
+						[ "${chn_list}" != "0" ] && add_port_rules "$ipt_tmp -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_redir_ports "$(dst $IPSET_CHN) $(get_jump_ipt ${chn_list} "${ipt_j}")"
+						[ "${use_shunt_tcp}" = "1" ] && add_port_rules "$ipt_tmp -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_redir_ports "$(dst $shunt_set_name) ${ipt_j}"
+						[ "${tcp_proxy_mode}" != "disable" ] && add_port_rules "$ipt_tmp -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_redir_ports "${ipt_j}"
+						[ -n "${is_tproxy}" ] && $ipt_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source} $(REDIRECT $tcp_port TPROXY)
+
+						[ "$PROXY_IPV6" == "1" ] && [ "$_ipv4" != "1" ] && {
+							$ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source} -d $FAKE_IP_6 -j PSW_RULE 2>/dev/null
+							[ "${use_proxy_list}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_redir_ports "$(dst $black6_set_name) -j PSW_RULE" 2>/dev/null
+							[ "${use_gfw_list}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_redir_ports "$(dst $gfw6_set_name) -j PSW_RULE" 2>/dev/null
+							[ "${chn_list}" != "0" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_redir_ports "$(dst $IPSET_CHN6) $(get_jump_ipt ${chn_list} "-j PSW_RULE")" 2>/dev/null
+							[ "${use_shunt_tcp}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_redir_ports "$(dst $shunt6_set_name) -j PSW_RULE" 2>/dev/null
+							[ "${tcp_proxy_mode}" != "disable" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source}" $tcp_redir_ports "-j PSW_RULE" 2>/dev/null
+							$ip6t_m -A PSW $(comment "$remarks") -p tcp ${_ipt_source} $(REDIRECT $tcp_port TPROXY) 2>/dev/null
+						}
+					else
+						msg2="${msg}不代理 TCP"
+					fi
+					echolog "     - ${msg2}"
+				}
+
+				[ "$_ipv4" != "1" ] && $ip6t_m -A PSW $(comment "$remarks") ${_ipt_source} -p tcp -j RETURN 2>/dev/null
+				$ipt_tmp -A PSW $(comment "$remarks") ${_ipt_source} -p tcp -j RETURN
+
+				[ -n "$udp_port" ] && {
+					if [ -n "${udp_proxy_mode}" ]; then
+						msg2="${msg}使用 UDP 节点[$udp_node_remark]"
+						msg2="${msg2}(TPROXY:${udp_port})"
+
+						$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source} -d $FAKE_IP -j PSW_RULE
+						[ "${use_proxy_list}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_redir_ports "$(dst $black_set_name) -j PSW_RULE"
+						[ "${use_gfw_list}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_redir_ports "$(dst $gfw_set_name) -j PSW_RULE"
+						[ "${chn_list}" != "0" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_redir_ports "$(dst $IPSET_CHN) $(get_jump_ipt ${chn_list} "-j PSW_RULE")"
+						[ "${use_shunt_udp}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_redir_ports "$(dst $shunt_set_name) -j PSW_RULE"
+						[ "${udp_proxy_mode}" != "disable" ] && add_port_rules "$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_redir_ports "-j PSW_RULE"
+						$ipt_m -A PSW $(comment "$remarks") -p udp ${_ipt_source} $(REDIRECT $udp_port TPROXY)
+
+						[ "$PROXY_IPV6" == "1" ] && [ "$_ipv4" != "1" ] && {
+							$ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source} -d $FAKE_IP_6 -j PSW_RULE 2>/dev/null
+							[ "${use_proxy_list}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_redir_ports "$(dst $black6_set_name) -j PSW_RULE" 2>/dev/null
+							[ "${use_gfw_list}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_redir_ports "$(dst $gfw6_set_name) -j PSW_RULE" 2>/dev/null
+							[ "${chn_list}" != "0" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_redir_ports "$(dst $IPSET_CHN6) $(get_jump_ipt ${chn_list} "-j PSW_RULE")" 2>/dev/null
+							[ "${use_shunt_udp}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_redir_ports "$(dst $shunt6_set_name) -j PSW_RULE" 2>/dev/null
+							[ "${udp_proxy_mode}" != "disable" ] && add_port_rules "$ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source}" $udp_redir_ports "-j PSW_RULE" 2>/dev/null
+							$ip6t_m -A PSW $(comment "$remarks") -p udp ${_ipt_source} $(REDIRECT $udp_port TPROXY) 2>/dev/null
+						}
+					else
+						msg2="${msg}不代理 UDP"
+					fi
+					echolog "     - ${msg2}"
+				}
+				[ "$_ipv4" != "1" ] && $ip6t_m -A PSW $(comment "$remarks") ${_ipt_source} -p udp -j RETURN 2>/dev/null
+				$ipt_m -A PSW $(comment "$remarks") ${_ipt_source} -p udp -j RETURN
+				unset ipt_tmp ipt_j _ipt_source msg msg2 _ipv4
+			done
+			unset enabled sid remarks sources use_global_config use_direct_list use_proxy_list use_block_list use_gfw_list chn_list tcp_proxy_mode udp_proxy_mode dns_redirect_port tcp_no_redir_ports udp_no_redir_ports tcp_proxy_drop_ports udp_proxy_drop_ports tcp_redir_ports udp_redir_ports tcp_node udp_node interface
+			unset tcp_port udp_port tcp_node_remark udp_node_remark _acl_list use_shunt_tcp use_shunt_udp dns_redirect
+		done
+	}
+	
+	[ "$ENABLED_DEFAULT_ACL" == 1 ] && [ "$CLIENT_PROXY" == 1 ] && {
+		msg="【默认】，"
+		local ipt_tmp=$ipt_n
+		[ -n "${is_tproxy}" ] && ipt_tmp=$ipt_m
+
+		[ "$TCP_NO_REDIR_PORTS" != "disable" ] && {
+			add_port_rules "$ip6t_m -A PSW $(comment "默认") -p tcp" $TCP_NO_REDIR_PORTS "-j RETURN"
+			add_port_rules "$ipt_tmp -A PSW $(comment "默认") -p tcp" $TCP_NO_REDIR_PORTS "-j RETURN"
+			if ! has_1_65535 "$TCP_NO_REDIR_PORTS"; then
+				echolog "     - ${msg}不代理 TCP 端口[${TCP_NO_REDIR_PORTS}]"
+			else
+				unset TCP_PROXY_MODE
+				echolog "     - ${msg}不代理所有 TCP 端口"
+			fi
+		}
+		
+		[ "$UDP_NO_REDIR_PORTS" != "disable" ] && {
+			add_port_rules "$ip6t_m -A PSW $(comment "默认") -p udp" $UDP_NO_REDIR_PORTS "-j RETURN"
+			add_port_rules "$ipt_m -A PSW $(comment "默认") -p udp" $UDP_NO_REDIR_PORTS "-j RETURN"
+			if ! has_1_65535 "$UDP_NO_REDIR_PORTS"; then
+				echolog "     - ${msg}不代理 UDP 端口[${UDP_NO_REDIR_PORTS}]"
+			else
+				unset UDP_PROXY_MODE
+				echolog "     - ${msg}不代理所有 UDP 端口"
+			fi
+		}
+		
+		local DNS_REDIRECT
+		[ $(config_t_get global dns_redirect "1") = "1" ] && DNS_REDIRECT=53
+		if ([ -n "$TCP_NODE" ] && [ -n "${TCP_PROXY_MODE}" ]) || ([ -n "$UDP_NODE" ] && [ -n "${UDP_PROXY_MODE}" ]); then
+			[ -n "${DNS_REDIRECT_PORT}" ] && DNS_REDIRECT=${DNS_REDIRECT_PORT}
+		else
+			[ -n "${DIRECT_DNSMASQ_PORT}" ] && DNS_REDIRECT=${DIRECT_DNSMASQ_PORT}
+		fi
+		
+		if [ -n "${DNS_REDIRECT}" ]; then
+			$ipt_m -A PSW $(comment "默认") -p udp --dport 53 -j RETURN
+			$ip6t_m -A PSW $(comment "默认") -p udp --dport 53 -j RETURN 2>/dev/null
+			$ipt_m -A PSW $(comment "默认") -p tcp --dport 53 -j RETURN
+			$ip6t_m -A PSW $(comment "默认") -p tcp --dport 53 -j RETURN 2>/dev/null
+			$ipt_n -A PSW_DNS $(comment "默认") -p udp --dport 53 -j REDIRECT --to-ports ${DNS_REDIRECT}
+			$ip6t_n -A PSW_DNS $(comment "默认") -p udp --dport 53 -j REDIRECT --to-ports ${DNS_REDIRECT} 2>/dev/null
+			$ipt_n -A PSW_DNS $(comment "默认") -p tcp --dport 53 -j REDIRECT --to-ports ${DNS_REDIRECT}
+			$ip6t_n -A PSW_DNS $(comment "默认") -p tcp --dport 53 -j REDIRECT --to-ports ${DNS_REDIRECT} 2>/dev/null
+		fi
+
+		[ -n "${TCP_PROXY_MODE}" -o -n "${UDP_PROXY_MODE}" ] && {
+			[ "${USE_BLOCK_LIST}" = "1" ] && $ipt_m -A PSW $(comment "默认") $(dst $IPSET_BLOCK) -j DROP
+			[ "${USE_DIRECT_LIST}" = "1" ] && $ipt_tmp -A PSW $(comment "默认") $(dst $IPSET_WHITE) -j RETURN
+			[ "$PROXY_IPV6" == "1" ] && {
+				[ "${USE_BLOCK_LIST}" = "1" ] && $ip6t_m -A PSW $(comment "默认") $(dst $IPSET_BLOCK6) -j DROP 2>/dev/null
+				[ "${USE_DIRECT_LIST}" = "1" ] && $ip6t_m -A PSW $(comment "默认") $(dst $IPSET_WHITE6) -j RETURN 2>/dev/null
+			}
+			
+			[ "$TCP_PROXY_DROP_PORTS" != "disable" ] && {
+				[ "$PROXY_IPV6" == "1" ] && {
+					add_port_rules "$ip6t_m -A PSW $(comment "默认") -p tcp" $TCP_PROXY_DROP_PORTS "-d $FAKE_IP_6 -j DROP"
+					[ "${USE_PROXY_LIST}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p tcp" $TCP_PROXY_DROP_PORTS "$(dst $IPSET_BLACK6) -j DROP"
+					[ "${USE_GFW_LIST}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p tcp" $TCP_PROXY_DROP_PORTS "$(dst $IPSET_GFW6) -j DROP"
+					[ "${CHN_LIST}" != "0" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p tcp" $TCP_PROXY_DROP_PORTS "$(dst $IPSET_CHN6) $(get_jump_ipt ${CHN_LIST} "-j DROP")"
+					[ "${USE_SHUNT_TCP}" = "1" ] && $ip6t_m -A PSW $(comment "默认") -p tcp $TCP_PROXY_DROP_PORTS "$(dst $IPSET_SHUNT6) -j DROP"
+					[ "${TCP_PROXY_MODE}" != "disable" ] && $ip6t_m -A PSW $(comment "默认") -p tcp $TCP_PROXY_DROP_PORTS "-j DROP"
+				}
+				add_port_rules "$ipt_m -A PSW $(comment "默认") -p tcp" $TCP_PROXY_DROP_PORTS "-d $FAKE_IP -j DROP"
+				[ "${USE_PROXY_LIST}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p tcp" $TCP_PROXY_DROP_PORTS "$(dst $IPSET_BLACK) -j DROP"
+				[ "${USE_GFW_LIST}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p tcp" $TCP_PROXY_DROP_PORTS "$(dst $IPSET_GFW) -j DROP"
+				[ "${CHN_LIST}" != "0" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p tcp" $TCP_PROXY_DROP_PORTS "$(dst $IPSET_CHN) $(get_jump_ipt ${CHN_LIST} "-j DROP")"
+				[ "${USE_SHUNT_TCP}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p tcp" $TCP_PROXY_DROP_PORTS $(dst $IPSET_SHUNT) "-j DROP"
+				[ "${TCP_PROXY_MODE}" != "disable" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p tcp" $TCP_PROXY_DROP_PORTS "-j DROP"
+				echolog "     - ${msg}屏蔽代理 TCP 端口[${TCP_PROXY_DROP_PORTS}]"
+			}
+			
+			[ "$UDP_PROXY_DROP_PORTS" != "disable" ] && {
+				[ "$PROXY_IPV6" == "1" ] && {
+					add_port_rules "$ip6t_m -A PSW $(comment "默认") -p udp" $UDP_PROXY_DROP_PORTS "-d $FAKE_IP_6 -j DROP"
+					[ "${USE_PROXY_LIST}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p udp" $UDP_PROXY_DROP_PORTS "$(dst $IPSET_BLACK6) -j DROP"
+					[ "${USE_GFW_LIST}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p udp" $UDP_PROXY_DROP_PORTS "$(dst $IPSET_GFW6) -j DROP"
+					[ "${CHN_LIST}" != "0" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p udp" $UDP_PROXY_DROP_PORTS "$(dst $IPSET_CHN6) $(get_jump_ipt ${CHN_LIST} "-j DROP")"
+					[ "${USE_SHUNT_TCP}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p udp" $UDP_PROXY_DROP_PORTS "$(dst $IPSET_SHUNT6) -j DROP"
+					[ "${UDP_PROXY_MODE}" != "disable" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p udp" $UDP_PROXY_DROP_PORTS "-j DROP"
+				}
+				add_port_rules "$ipt_m -A PSW $(comment "默认") -p udp" $UDP_PROXY_DROP_PORTS "-d $FAKE_IP -j DROP"
+				[ "${USE_PROXY_LIST}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p udp" $UDP_PROXY_DROP_PORTS "$(dst $IPSET_BLACK) -j DROP"
+				[ "${USE_GFW_LIST}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p udp" $UDP_PROXY_DROP_PORTS "$(dst $IPSET_GFW) -j DROP"
+				[ "${CHN_LIST}" != "0" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p udp" $UDP_PROXY_DROP_PORTS "$(dst $IPSET_CHN) $(get_jump_ipt ${CHN_LIST} "-j DROP")"
+				[ "${USE_SHUNT_UDP}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p udp" $UDP_PROXY_DROP_PORTS "$(dst $IPSET_SHUNT) -j DROP"
+				[ "${UDP_PROXY_MODE}" != "disable" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p udp" $UDP_PROXY_DROP_PORTS "-j DROP"
+				echolog "     - ${msg}屏蔽代理 UDP 端口[${UDP_PROXY_DROP_PORTS}]"
+			}
+		}
+
+		#  加载TCP默认代理模式
+		if [ -n "${TCP_PROXY_MODE}" ]; then
+			[ -n "$TCP_NODE" ] && {
+				msg2="${msg}使用 TCP 节点[$(config_n_get $TCP_NODE remarks)]"
+				if [ -n "${is_tproxy}" ]; then
+					msg2="${msg2}(TPROXY:${TCP_REDIR_PORT})"
+					ipt_j="-j PSW_RULE"
+				else
+					msg2="${msg2}(REDIRECT:${TCP_REDIR_PORT})"
+					ipt_j="$(REDIRECT $TCP_REDIR_PORT)"
+				fi
+				
+				[ "$accept_icmp" = "1" ] && {
+					$ipt_n -A PSW $(comment "默认") -p icmp -d $FAKE_IP $(REDIRECT)
+					[ "${USE_PROXY_LIST}" = "1" ] && $ipt_n -A PSW $(comment "默认") -p icmp $(dst $IPSET_BLACK) $(REDIRECT)
+					[ "${USE_GFW_LIST}" = "1" ] && $ipt_n -A PSW $(comment "默认") -p icmp $(dst $IPSET_GFW) $(REDIRECT)
+					[ "${CHN_LIST}" != "0" ] && $ipt_n -A PSW $(comment "默认") -p icmp $(dst $IPSET_CHN) $(get_jump_ipt ${CHN_LIST})
+					[ "${USE_SHUNT_TCP}" = "1" ] && $ipt_n -A PSW $(comment "默认") -p icmp $(dst $IPSET_SHUNT) $(REDIRECT)
+					[ "${TCP_PROXY_MODE}" != "disable" ] && $ipt_n -A PSW $(comment "默认") -p icmp $(REDIRECT)
+				}
+				
+				[ "$accept_icmpv6" = "1" ] && [ "$PROXY_IPV6" == "1" ] && {
+					$ip6t_n -A PSW $(comment "默认") -p ipv6-icmp -d $FAKE_IP_6 $(REDIRECT)
+					[ "${USE_PROXY_LIST}" = "1" ] && $ip6t_n -A PSW $(comment "默认") -p ipv6-icmp $(dst $IPSET_BLACK6) $(REDIRECT)
+					[ "${USE_GFW_LIST}" = "1" ] && $ip6t_n -A PSW $(comment "默认") -p ipv6-icmp $(dst $IPSET_GFW6) $(REDIRECT)
+					[ "${CHN_LIST}" != "0" ] && $ip6t_n -A PSW $(comment "默认") -p ipv6-icmp $(dst $IPSET_CHN6) $(get_jump_ipt ${CHN_LIST})
+					[ "${USE_SHUNT_TCP}" = "1" ] && $ip6t_n -A PSW $(comment "默认") -p ipv6-icmp $(dst $IPSET_SHUNT6) $(REDIRECT)
+					[ "${TCP_PROXY_MODE}" != "disable" ] && $ip6t_n -A PSW $(comment "默认") -p ipv6-icmp $(REDIRECT)
+				}
+
+				$ipt_tmp -A PSW $(comment "默认") -p tcp -d $FAKE_IP ${ipt_j}
+				[ "${USE_PROXY_LIST}" = "1" ] && add_port_rules "$ipt_tmp -A PSW $(comment "默认") -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_BLACK) ${ipt_j}"
+				[ "${USE_GFW_LIST}" = "1" ] && add_port_rules "$ipt_tmp -A PSW $(comment "默认") -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_GFW) ${ipt_j}"
+				[ "${CHN_LIST}" != "0" ] && add_port_rules "$ipt_tmp -A PSW $(comment "默认") -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_CHN) $(get_jump_ipt ${CHN_LIST} "${ipt_j}")"
+				[ "${USE_SHUNT_TCP}" = "1" ] && add_port_rules "$ipt_tmp -A PSW $(comment "默认") -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_SHUNT) ${ipt_j}"
+				[ "${TCP_PROXY_MODE}" != "disable" ] && add_port_rules "$ipt_tmp -A PSW $(comment "默认") -p tcp" $TCP_REDIR_PORTS "${ipt_j}"
+				[ -n "${is_tproxy}" ]&& $ipt_tmp -A PSW $(comment "默认") -p tcp $(REDIRECT $TCP_REDIR_PORT TPROXY)
+
+				[ "$PROXY_IPV6" == "1" ] && {
+					$ip6t_m -A PSW $(comment "默认") -p tcp -d $FAKE_IP_6 -j PSW_RULE
+					[ "${USE_PROXY_LIST}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_BLACK6) -j PSW_RULE"
+					[ "${USE_GFW_LIST}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_GFW6) -j PSW_RULE"
+					[ "${CHN_LIST}" != "0" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_CHN6) $(get_jump_ipt ${CHN_LIST} "-j PSW_RULE")"
+					[ "${USE_SHUNT_TCP}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_SHUNT6) -j PSW_RULE"
+					[ "${TCP_PROXY_MODE}" != "disable" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p tcp" $TCP_REDIR_PORTS "-j PSW_RULE"
+					$ip6t_m -A PSW $(comment "默认") -p tcp $(REDIRECT $TCP_REDIR_PORT TPROXY)
+				}
+
+				echolog "     - ${msg2}"
+			}
+		fi
+		$ipt_n -A PSW $(comment "默认") -p tcp -j RETURN
+		$ipt_m -A PSW $(comment "默认") -p tcp -j RETURN
+		$ip6t_m -A PSW $(comment "默认") -p tcp -j RETURN
+
+		#  加载UDP默认代理模式
+		if [ -n "${UDP_PROXY_MODE}" ]; then
+			[ -n "$UDP_NODE" -o "$TCP_UDP" = "1" ] && {
+				msg2="${msg}使用 UDP 节点[$(config_n_get $UDP_NODE remarks)](TPROXY:${UDP_REDIR_PORT})"
+
+				$ipt_m -A PSW $(comment "默认") -p udp -d $FAKE_IP -j PSW_RULE
+				[ "${USE_PROXY_LIST}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_BLACK) -j PSW_RULE"
+				[ "${USE_GFW_LIST}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_GFW) -j PSW_RULE"
+				[ "${CHN_LIST}" != "0" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_CHN) $(get_jump_ipt ${CHN_LIST} "-j PSW_RULE")"
+				[ "${USE_SHUNT_UDP}" = "1" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_SHUNT) -j PSW_RULE"
+				[ "${UDP_PROXY_MODE}" != "disable" ] && add_port_rules "$ipt_m -A PSW $(comment "默认") -p udp" $UDP_REDIR_PORTS "-j PSW_RULE"
+				$ipt_m -A PSW $(comment "默认") -p udp $(REDIRECT $UDP_REDIR_PORT TPROXY)
+
+				[ "$PROXY_IPV6" == "1" ] && {
+					$ip6t_m -A PSW $(comment "默认") -p udp -d $FAKE_IP_6 -j PSW_RULE
+					[ "${USE_PROXY_LIST}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_BLACK6) -j PSW_RULE"
+					[ "${USE_GFW_LIST}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_GFW6) -j PSW_RULE"
+					[ "${CHN_LIST}" != "0" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_CHN6) $(get_jump_ipt ${CHN_LIST} "-j PSW_RULE")"
+					[ "${USE_SHUNT_UDP}" = "1" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_SHUNT6) -j PSW_RULE"
+					[ "${UDP_PROXY_MODE}" != "disable" ] && add_port_rules "$ip6t_m -A PSW $(comment "默认") -p udp" $UDP_REDIR_PORTS "-j PSW_RULE"
+					$ip6t_m -A PSW $(comment "默认") -p udp $(REDIRECT $UDP_REDIR_PORT TPROXY)
+				}
+
+				echolog "     - ${msg2}"
+			}
+		fi
+		$ipt_m -A PSW $(comment "默认") -p udp -j RETURN
+		$ip6t_m -A PSW $(comment "默认") -p udp -j RETURN
+	}
+}
+
+filter_haproxy() {
+	for item in ${haproxy_items}; do
+		local ip=$(get_host_ip ipv4 $(echo $item | awk -F ":" '{print $1}') 1)
+		ipset -q add $IPSET_VPS $ip
+	done
+	echolog "  - [$?]加入负载均衡的节点到ipset[$IPSET_VPS]直连完成"
+}
+
+filter_vpsip() {
+	uci show $CONFIG | grep -E "(.address=|.download_address=)" | cut -d "'" -f 2 | grep -E "([0-9]{1,3}[\.]){3}[0-9]{1,3}" | grep -v "^127\.0\.0\.1$" | sed -e "/^$/d" | sed -e "s/^/add $IPSET_VPS &/g" | awk '{print $0} END{print "COMMIT"}' | ipset -! -R
+	echolog "  - [$?]加入所有IPv4节点到ipset[$IPSET_VPS]直连完成"
+	uci show $CONFIG | grep -E "(.address=|.download_address=)" | cut -d "'" -f 2 | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | sed -e "/^$/d" | sed -e "s/^/add $IPSET_VPS6 &/g" | awk '{print $0} END{print "COMMIT"}' | ipset -! -R
+	echolog "  - [$?]加入所有IPv6节点到ipset[$IPSET_VPS6]直连完成"
+}
+
+filter_server_port() {
+	local address=${1}
+	local port=${2}
+	local stream=${3}
+	stream=$(echo ${3} | tr 'A-Z' 'a-z')
+	local _is_tproxy ipt_tmp
+	ipt_tmp=$ipt_n
+	_is_tproxy=${is_tproxy}
+	[ "$stream" == "udp" ] && _is_tproxy="TPROXY"
+	[ -n "${_is_tproxy}" ] && ipt_tmp=$ipt_m
+
+	for _ipt in 4 6; do
+		[ "$_ipt" == "4" ] && _ipt=$ipt_tmp
+		[ "$_ipt" == "6" ] && _ipt=$ip6t_m
+		$_ipt -n -L PSW_OUTPUT | grep -q "${address}:${port}"
+		if [ $? -ne 0 ]; then
+			$_ipt -I PSW_OUTPUT $(comment "${address}:${port}") -p $stream -d $address --dport $port -j RETURN 2>/dev/null
+		fi
+	done
+}
+
+filter_node() {
+	local node=${1}
+	local stream=${2}
+	if [ -n "$node" ]; then
+		local address=$(config_n_get $node address)
+		local port=$(config_n_get $node port)
+		[ -z "$address" ] && [ -z "$port" ] && {
+			return 1
+		}
+		filter_server_port $address $port $stream
+		filter_server_port $address $port $stream
+	fi
+}
+
+filter_direct_node_list() {
+	[ ! -s "$TMP_PATH/direct_node_list" ] && return
+	for _node_id in $(cat $TMP_PATH/direct_node_list | awk '!seen[$0]++'); do
+		filter_node "$_node_id" TCP
+		filter_node "$_node_id" UDP
+		unset _node_id
+	done
+}
+
+add_firewall_rule() {
+	echolog "开始加载 iptables 防火墙规则..."
+	ipset -! create $IPSET_LOCAL nethash maxelem 1048576
+	ipset -! create $IPSET_LAN nethash maxelem 1048576
+	ipset -! create $IPSET_VPS nethash maxelem 1048576
+	ipset -! create $IPSET_SHUNT nethash maxelem 1048576 timeout 172800
+	ipset -! create $IPSET_GFW nethash maxelem 1048576 timeout 172800
+	ipset -! create $IPSET_CHN nethash maxelem 1048576 timeout 172800
+	ipset -! create $IPSET_BLACK nethash maxelem 1048576 timeout 172800
+	ipset -! create $IPSET_WHITE nethash maxelem 1048576 timeout 172800
+	ipset -! create $IPSET_BLOCK nethash maxelem 1048576 timeout 172800
+
+	ipset -! create $IPSET_LOCAL6 nethash family inet6 maxelem 1048576
+	ipset -! create $IPSET_LAN6 nethash family inet6 maxelem 1048576
+	ipset -! create $IPSET_VPS6 nethash family inet6 maxelem 1048576
+	ipset -! create $IPSET_SHUNT6 nethash family inet6 maxelem 1048576 timeout 172800
+	ipset -! create $IPSET_GFW6 nethash family inet6 maxelem 1048576 timeout 172800
+	ipset -! create $IPSET_CHN6 nethash family inet6 maxelem 1048576 timeout 172800
+	ipset -! create $IPSET_BLACK6 nethash family inet6 maxelem 1048576 timeout 172800
+	ipset -! create $IPSET_WHITE6 nethash family inet6 maxelem 1048576 timeout 172800
+	ipset -! create $IPSET_BLOCK6 nethash family inet6 maxelem 1048576 timeout 172800
+
+	cat $RULES_PATH/chnroute | tr -s '\n' | grep -v "^#" | sed -e "/^$/d" | sed -e "s/^/add $IPSET_CHN &/g" -e "s/$/ timeout 0/g" | ipset -! -R
+	cat $RULES_PATH/chnroute6 | tr -s '\n' | grep -v "^#" | sed -e "/^$/d" | sed -e "s/^/add $IPSET_CHN6 &/g" -e "s/$/ timeout 0/g" | ipset -! -R
+
+	#导入规则列表、分流规则中的IP列表
+	local USE_SHUNT_NODE=0
+	local USE_PROXY_LIST_ALL=${USE_PROXY_LIST}
+	local USE_DIRECT_LIST_ALL=${USE_DIRECT_LIST}
+	local USE_BLOCK_LIST_ALL=${USE_BLOCK_LIST}
+	local _TCP_NODE=$(config_t_get global tcp_node)
+	local _UDP_NODE=$(config_t_get global udp_node)
+	local USE_GEOVIEW=$(config_t_get global_rules enable_geoview)
+
+	[ -n "$_TCP_NODE" ] && [ "$(config_n_get $_TCP_NODE protocol)" = "_shunt" ] && USE_SHUNT_TCP=1 && USE_SHUNT_NODE=1
+	[ -n "$_UDP_NODE" ] && [ "$(config_n_get $_UDP_NODE protocol)" = "_shunt" ] && USE_SHUNT_UDP=1 && USE_SHUNT_NODE=1
+	[ "$_UDP_NODE" = "tcp" ] && USE_SHUNT_UDP=$USE_SHUNT_TCP
+
+	for acl_section in $(uci show ${CONFIG} | grep "=acl_rule" | cut -d '.' -sf 2 | cut -d '=' -sf 1); do
+		[ "$(config_n_get $acl_section enabled)" != "1" ] && continue
+		[ "$(config_n_get $acl_section use_global_config 0)" != "1" ] && {
+			[ "$(config_n_get $acl_section use_direct_list 1)" = "1" ] && USE_PROXY_LIST_ALL=1
+			[ "$(config_n_get $acl_section use_proxy_list 1)" = "1" ] && USE_DIRECT_LIST_ALL=1
+			[ "$(config_n_get $acl_section use_block_list 1)" = "1" ] && USE_BLOCK_LIST_ALL=1
+		}
+		for _node in $(config_n_get $acl_section tcp_node) $(config_n_get $acl_section udp_node); do
+			local node_protocol=$(config_n_get $_node protocol)
+			[ "$node_protocol" = "_shunt" ] && { USE_SHUNT_NODE=1; break; }
+		done
+	done
+
+	#直连列表
+	[ "$USE_DIRECT_LIST_ALL" = "1" ] && {
+		cat $RULES_PATH/direct_ip | tr -s "\r\n" "\n" | grep -v "^#" | sed -e "/^$/d" | grep -E "(\.((2(5[0-5]|[0-4][0-9]))|[0-1]?[0-9]{1,2})){3}" | sed -e "s/^/add $IPSET_WHITE &/g" -e "s/$/ timeout 0/g" | ipset -! -R
+		cat $RULES_PATH/direct_ip | tr -s "\r\n" "\n" | grep -v "^#" | sed -e "/^$/d" | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | sed -e "s/^/add $IPSET_WHITE6 &/g" -e "s/$/ timeout 0/g" | ipset -! -R
+		[ "$USE_GEOVIEW" = "1" ] && {
+			local GEOIP_CODE=$(cat $RULES_PATH/direct_ip | tr -s "\r\n" "\n" | sed -e "/^$/d" | grep -E "^geoip:" | grep -v "^geoip:private" | sed -E 's/^geoip:(.*)/\1/' | sed ':a;N;$!ba;s/\n/,/g')
+			if [ -n "$GEOIP_CODE" ] && type geoview &> /dev/null; then
+				get_geoip $GEOIP_CODE ipv4 | grep -E "(\.((2(5[0-5]|[0-4][0-9]))|[0-1]?[0-9]{1,2})){3}" | sed -e "s/^/add $IPSET_WHITE &/g" -e "s/$/ timeout 0/g" | ipset -! -R
+				get_geoip $GEOIP_CODE ipv6 | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | sed -e "s/^/add $IPSET_WHITE6 &/g" -e "s/$/ timeout 0/g" | ipset -! -R
+				echolog "  - [$?]解析并加入[直连列表] GeoIP 到 IPSET 完成"
+			fi
+		}
+	}
+
+	#代理列表
+	[ "$USE_PROXY_LIST_ALL" = "1" ] && {
+		cat $RULES_PATH/proxy_ip | tr -s "\r\n" "\n" | grep -v "^#" | sed -e "/^$/d" | grep -E "(\.((2(5[0-5]|[0-4][0-9]))|[0-1]?[0-9]{1,2})){3}" | sed -e "s/^/add $IPSET_BLACK &/g" -e "s/$/ timeout 0/g" | ipset -! -R
+		cat $RULES_PATH/proxy_ip | tr -s "\r\n" "\n" | grep -v "^#" | sed -e "/^$/d" | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | sed -e "s/^/add $IPSET_BLACK6 &/g" -e "s/$/ timeout 0/g" | ipset -! -R
+		[ "$USE_GEOVIEW" = "1" ] && {
+			local GEOIP_CODE=$(cat $RULES_PATH/proxy_ip | tr -s "\r\n" "\n" | sed -e "/^$/d" | grep -E "^geoip:" | grep -v "^geoip:private" | sed -E 's/^geoip:(.*)/\1/' | sed ':a;N;$!ba;s/\n/,/g')
+			if [ -n "$GEOIP_CODE" ] && type geoview &> /dev/null; then
+				get_geoip $GEOIP_CODE ipv4 | grep -E "(\.((2(5[0-5]|[0-4][0-9]))|[0-1]?[0-9]{1,2})){3}" | sed -e "s/^/add $IPSET_BLACK &/g" -e "s/$/ timeout 0/g" | ipset -! -R
+				get_geoip $GEOIP_CODE ipv6 | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | sed -e "s/^/add $IPSET_BLACK6 &/g" -e "s/$/ timeout 0/g" | ipset -! -R
+				echolog "  - [$?]解析并加入[代理列表] GeoIP 到 IPSET 完成"
+			fi
+		}
+	}
+
+	#屏蔽列表
+	[ "$USE_BLOCK_LIST_ALL" = "1" ] && {
+		cat $RULES_PATH/block_ip | tr -s "\r\n" "\n" | grep -v "^#" | sed -e "/^$/d" | grep -E "(\.((2(5[0-5]|[0-4][0-9]))|[0-1]?[0-9]{1,2})){3}" | sed -e "s/^/add $IPSET_BLOCK &/g" -e "s/$/ timeout 0/g" | ipset -! -R
+		cat $RULES_PATH/block_ip | tr -s "\r\n" "\n" | grep -v "^#" | sed -e "/^$/d" | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | sed -e "s/^/add $IPSET_BLOCK6 &/g" -e "s/$/ timeout 0/g" | ipset -! -R
+		[ "$USE_GEOVIEW" = "1" ] && {
+			local GEOIP_CODE=$(cat $RULES_PATH/block_ip | tr -s "\r\n" "\n" | sed -e "/^$/d" | grep -E "^geoip:" | grep -v "^geoip:private" | sed -E 's/^geoip:(.*)/\1/' | sed ':a;N;$!ba;s/\n/,/g')
+			if [ -n "$GEOIP_CODE" ] && type geoview &> /dev/null; then
+				get_geoip $GEOIP_CODE ipv4 | grep -E "(\.((2(5[0-5]|[0-4][0-9]))|[0-1]?[0-9]{1,2})){3}" | sed -e "s/^/add $IPSET_BLOCK &/g" -e "s/$/ timeout 0/g" | ipset -! -R
+				get_geoip $GEOIP_CODE ipv6 | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | sed -e "s/^/add $IPSET_BLOCK6 &/g" -e "s/$/ timeout 0/g" | ipset -! -R
+				echolog "  - [$?]解析并加入[屏蔽列表] GeoIP 到 IPSET 完成"
+			fi
+		}
+	}
+
+	#分流列表
+	[ "$USE_SHUNT_NODE" = "1" ] && {
+		local GEOIP_CODE=""
+		local shunt_ids=$(uci show $CONFIG | grep "=shunt_rules" | awk -F '.' '{print $2}' | awk -F '=' '{print $1}')
+		for shunt_id in $shunt_ids; do
+			config_n_get $shunt_id ip_list | tr -s "\r\n" "\n" | grep -v "^#" | sed -e "/^$/d" | grep -E "(\.((2(5[0-5]|[0-4][0-9]))|[0-1]?[0-9]{1,2})){3}" | sed -e "s/^/add $IPSET_SHUNT &/g" -e "s/$/ timeout 0/g" | ipset -! -R
+			config_n_get $shunt_id ip_list | tr -s "\r\n" "\n" | grep -v "^#" | sed -e "/^$/d" | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | sed -e "s/^/add $IPSET_SHUNT6 &/g" -e "s/$/ timeout 0/g" | ipset -! -R
+			[ "$USE_GEOVIEW" = "1" ] && {
+				local geoip_code=$(config_n_get $shunt_id ip_list | tr -s "\r\n" "\n" | sed -e "/^$/d" | grep -E "^geoip:" | grep -v "^geoip:private" | sed -E 's/^geoip:(.*)/\1/' | sed ':a;N;$!ba;s/\n/,/g')
+				[ -n "$geoip_code" ] && GEOIP_CODE="${GEOIP_CODE:+$GEOIP_CODE,}$geoip_code"
+			}
+		done
+		if [ -n "$GEOIP_CODE" ] && type geoview &> /dev/null; then
+			get_geoip $GEOIP_CODE ipv4 | grep -E "(\.((2(5[0-5]|[0-4][0-9]))|[0-1]?[0-9]{1,2})){3}" | sed -e "s/^/add $IPSET_SHUNT &/g" -e "s/$/ timeout 0/g" | ipset -! -R
+			get_geoip $GEOIP_CODE ipv6 | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | sed -e "s/^/add $IPSET_SHUNT6 &/g" -e "s/$/ timeout 0/g" | ipset -! -R
+			echolog "  - [$?]解析并加入[分流节点] GeoIP 到 IPSET 完成"
+		fi
+	}
+	
+	ipset -! -R <<-EOF
+		$(ip address show | grep -w "inet" | awk '{print $2}' | awk -F '/' '{print $1}' | sed -e "s/^/add $IPSET_LOCAL /")
+	EOF
+
+	ipset -! -R <<-EOF
+		$(ip address show | grep -w "inet6" | awk '{print $2}' | awk -F '/' '{print $1}' | sed -e "s/^/add $IPSET_LOCAL6 /")
+	EOF
+
+	#局域网IP列表
+	ipset -! -R <<-EOF
+		$(gen_lanlist | sed -e "s/^/add $IPSET_LAN /")
+	EOF
+
+	ipset -! -R <<-EOF
+		$(gen_lanlist_6 | sed -e "s/^/add $IPSET_LAN6 /")
+	EOF
+
+	# 忽略特殊IP段
+	local lan_ifname lan_ip
+	lan_ifname=$(uci -q -p /tmp/state get network.lan.device)
+	[ -n "$lan_ifname" ] && {
+		lan_ip=$(ip address show $lan_ifname | grep -w "inet" | awk '{print $2}')
+		lan_ip6=$(ip address show $lan_ifname | grep -w "inet6" | awk '{print $2}')
+		#echolog "本机IPv4网段互访直连：${lan_ip}"
+		#echolog "本机IPv6网段互访直连：${lan_ip6}"
+
+		[ -n "$lan_ip" ] && ipset -! -R <<-EOF
+			$(echo $lan_ip | sed -e "s/ /\n/g" | sed -e "s/^/add $IPSET_LAN /")
+		EOF
+
+		[ -n "$lan_ip6" ] && ipset -! -R <<-EOF
+			$(echo $lan_ip6 | sed -e "s/ /\n/g" | sed -e "s/^/add $IPSET_LAN6 /")
+		EOF
+	}
+
+	[ -n "$ISP_DNS" ] && {
+		#echolog "处理 ISP DNS 例外..."
+		for ispip in $ISP_DNS; do
+			ipset -! add $IPSET_WHITE $ispip timeout 0
+			echolog "  - [$?]追加ISP IPv4 DNS到白名单：${ispip}"
+		done
+	}
+
+	[ -n "$ISP_DNS6" ] && {
+		#echolog "处理 ISP IPv6 DNS 例外..."
+		for ispip6 in $ISP_DNS6; do
+			ipset -! add $IPSET_WHITE6 $ispip6 timeout 0
+			echolog "  - [$?]追加ISP IPv6 DNS到白名单：${ispip6}"
+		done
+	}
+
+	#  过滤所有节点IP
+	filter_vpsip > /dev/null 2>&1 &
+	# filter_haproxy > /dev/null 2>&1 &
+
+	accept_icmp=$(config_t_get global_forwarding accept_icmp 0)
+	accept_icmpv6=$(config_t_get global_forwarding accept_icmpv6 0)
+
+	if [ "${TCP_PROXY_WAY}" = "redirect" ]; then
+		unset is_tproxy
+	elif [ "${TCP_PROXY_WAY}" = "tproxy" ]; then
+		is_tproxy="TPROXY"
+	fi
+
+	$ipt_n -N PSW
+	$ipt_n -A PSW $(dst $IPSET_LAN) -j RETURN
+	$ipt_n -A PSW $(dst $IPSET_VPS) -j RETURN
+
+	WAN_IP=$(get_wan_ip)
+	[ ! -z "${WAN_IP}" ] && $ipt_n -A PSW $(comment "WAN_IP_RETURN") -d "${WAN_IP}" -j RETURN
+	
+	[ "$accept_icmp" = "1" ] && insert_rule_after "$ipt_n" "PREROUTING" "prerouting_rule" "-p icmp -j PSW"
+	[ -z "${is_tproxy}" ] && insert_rule_after "$ipt_n" "PREROUTING" "prerouting_rule" "-p tcp -j PSW"
+
+	$ipt_n -N PSW_OUTPUT
+	$ipt_n -A PSW_OUTPUT $(dst $IPSET_LAN) -j RETURN
+	$ipt_n -A PSW_OUTPUT $(dst $IPSET_VPS) -j RETURN
+	[ "${USE_DIRECT_LIST}" = "1" ] && $ipt_n -A PSW_OUTPUT $(dst $IPSET_WHITE) -j RETURN
+	$ipt_n -A PSW_OUTPUT -m mark --mark 0xff -j RETURN
+
+	$ipt_n -N PSW_DNS
+	if [ $(config_t_get global dns_redirect "1") = "0" ]; then
+		#Only hijack when dest address is local IP
+		$ipt_n -I PREROUTING $(dst $IPSET_LOCAL) -j PSW_DNS
+	else
+		$ipt_n -I PREROUTING 1 -j PSW_DNS
+	fi
+
+	$ipt_m -N PSW_DIVERT
+	$ipt_m -A PSW_DIVERT -j MARK --set-mark 1
+	$ipt_m -A PSW_DIVERT -j ACCEPT
+
+	$ipt_m -N PSW_RULE
+	$ipt_m -A PSW_RULE -j CONNMARK --restore-mark
+	$ipt_m -A PSW_RULE -m mark --mark 1 -j RETURN
+	$ipt_m -A PSW_RULE -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -j MARK --set-xmark 1
+	$ipt_m -A PSW_RULE -p udp -m conntrack --ctstate NEW -j MARK --set-xmark 1
+	$ipt_m -A PSW_RULE -j CONNMARK --save-mark
+
+	$ipt_m -N PSW
+	$ipt_m -A PSW $(dst $IPSET_LAN) -j RETURN
+	$ipt_m -A PSW $(dst $IPSET_VPS) -j RETURN
+	
+	[ ! -z "${WAN_IP}" ] && {
+		$ipt_m -A PSW $(comment "WAN_IP_RETURN") -d "${WAN_IP}" -j RETURN
+		echolog "  - [$?]追加WAN IP到iptables：${WAN_IP}"
+	}
+	unset WAN_IP
+
+	insert_rule_before "$ipt_m" "PREROUTING" "mwan3" "-j PSW"
+	insert_rule_before "$ipt_m" "PREROUTING" "PSW" "-p tcp -m socket -j PSW_DIVERT"
+
+	$ipt_m -N PSW_OUTPUT
+	$ipt_m -A PSW_OUTPUT $(dst $IPSET_LAN) -j RETURN
+	$ipt_m -A PSW_OUTPUT $(dst $IPSET_VPS) -j RETURN
+
+	[ -n "$IPT_APPEND_DNS" ] && {
+		local local_dns dns_address dns_port
+		for local_dns in $(echo $IPT_APPEND_DNS | tr ',' ' '); do
+			dns_address=$(echo "$local_dns" | sed -E 's/(@|\[)?([0-9a-fA-F:.]+)(@|#|$).*/\2/')
+			dns_port=$(echo "$local_dns" | sed -nE 's/.*#([0-9]+)$/\1/p')
+			if echo "$dns_address" | grep -q -v ':'; then
+				$ipt_m -A PSW_OUTPUT -p udp -d ${dns_address} --dport ${dns_port:-53} -j RETURN
+				$ipt_m -A PSW_OUTPUT -p tcp -d ${dns_address} --dport ${dns_port:-53} -j RETURN
+				echolog "  - [$?]追加直连DNS到iptables：${dns_address}:${dns_port:-53}"
+			else
+				$ip6t_m -A PSW_OUTPUT -p udp -d ${dns_address} --dport ${dns_port:-53} -j RETURN
+				$ip6t_m -A PSW_OUTPUT -p tcp -d ${dns_address} --dport ${dns_port:-53} -j RETURN
+				echolog "  - [$?]追加直连DNS到iptables：[${dns_address}]:${dns_port:-53}"
+			fi
+		done
+	}
+
+	[ "${USE_BLOCK_LIST}" = "1" ] && $ipt_m -A PSW_OUTPUT $(dst $IPSET_BLOCK) -j DROP
+	[ "${USE_DIRECT_LIST}" = "1" ] && $ipt_m -A PSW_OUTPUT $(dst $IPSET_WHITE) -j RETURN
+	$ipt_m -A PSW_OUTPUT -m mark --mark 0xff -j RETURN
+
+	ip rule add fwmark 1 lookup 100
+	ip route add local 0.0.0.0/0 dev lo table 100
+
+	[ "$accept_icmpv6" = "1" ] && {
+		$ip6t_n -N PSW
+		$ip6t_n -A PSW $(dst $IPSET_LAN6) -j RETURN
+		$ip6t_n -A PSW $(dst $IPSET_VPS6) -j RETURN
+		$ip6t_n -A PREROUTING -p ipv6-icmp -j PSW
+
+		$ip6t_n -N PSW_OUTPUT
+		$ip6t_n -A PSW_OUTPUT $(dst $IPSET_LAN6) -j RETURN
+		$ip6t_n -A PSW_OUTPUT $(dst $IPSET_VPS6) -j RETURN
+		[ "${USE_DIRECT_LIST}" = "1" ] && $ip6t_n -A PSW_OUTPUT $(dst $IPSET_WHITE6) -j RETURN
+		$ip6t_n -A PSW_OUTPUT -m mark --mark 0xff -j RETURN
+	}
+
+	$ip6t_n -N PSW_DNS
+	if [ $(config_t_get global dns_redirect "1") = "0" ]; then
+		#Only hijack when dest address is local IP
+		$ip6t_n -I PREROUTING $(dst $IPSET_LOCAL6) -j PSW_DNS
+	else
+		$ip6t_n -I PREROUTING 1 -j PSW_DNS
+	fi
+
+	$ip6t_m -N PSW_DIVERT
+	$ip6t_m -A PSW_DIVERT -j MARK --set-mark 1
+	$ip6t_m -A PSW_DIVERT -j ACCEPT
+
+	$ip6t_m -N PSW_RULE
+	$ip6t_m -A PSW_RULE -j CONNMARK --restore-mark
+	$ip6t_m -A PSW_RULE -m mark --mark 1 -j RETURN
+	$ip6t_m -A PSW_RULE -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -j MARK --set-xmark 1
+	$ip6t_m -A PSW_RULE -p udp -m conntrack --ctstate NEW -j MARK --set-xmark 1
+	$ip6t_m -A PSW_RULE -j CONNMARK --save-mark
+
+	$ip6t_m -N PSW
+	$ip6t_m -A PSW $(dst $IPSET_LAN6) -j RETURN
+	$ip6t_m -A PSW $(dst $IPSET_VPS6) -j RETURN
+	
+	WAN6_IP=$(get_wan6_ip)
+	[ ! -z "${WAN6_IP}" ] && $ip6t_m -A PSW $(comment "WAN6_IP_RETURN") -d ${WAN6_IP} -j RETURN
+	unset WAN6_IP
+
+	insert_rule_before "$ip6t_m" "PREROUTING" "mwan3" "-j PSW"
+	insert_rule_before "$ip6t_m" "PREROUTING" "PSW" "-p tcp -m socket -j PSW_DIVERT"
+
+	$ip6t_m -N PSW_OUTPUT
+	$ip6t_m -A PSW_OUTPUT -m mark --mark 0xff -j RETURN
+	$ip6t_m -A PSW_OUTPUT $(dst $IPSET_LAN6) -j RETURN
+	$ip6t_m -A PSW_OUTPUT $(dst $IPSET_VPS6) -j RETURN
+	[ "${USE_BLOCK_LIST}" = "1" ] && $ip6t_m -A PSW_OUTPUT $(dst $IPSET_BLOCK6) -j DROP
+	[ "${USE_DIRECT_LIST}" = "1" ] && $ip6t_m -A PSW_OUTPUT $(dst $IPSET_WHITE6) -j RETURN
+
+	ip -6 rule add fwmark 1 table 100
+	ip -6 route add local ::/0 dev lo table 100
+	
+	[ "$TCP_UDP" = "1" ] && [ -z "$UDP_NODE" ] && UDP_NODE=$TCP_NODE
+
+	[ "$ENABLED_DEFAULT_ACL" == 1 ] && {
+		local ipt_tmp=$ipt_n
+		if [ -n "${is_tproxy}" ]; then
+			ipt_tmp=$ipt_m
+			ipt_j="-j PSW_RULE"
+		else
+			ipt_j="$(REDIRECT $TCP_REDIR_PORT)"
+		fi
+		
+		msg="【路由器本机】，"
+		[ "$TCP_NO_REDIR_PORTS" != "disable" ] && {
+			add_port_rules "$ipt_tmp -A PSW_OUTPUT -p tcp" $TCP_NO_REDIR_PORTS "-j RETURN"
+			add_port_rules "$ip6t_m -A PSW_OUTPUT -p tcp" $TCP_NO_REDIR_PORTS "-j RETURN"
+			if ! has_1_65535 "$TCP_NO_REDIR_PORTS"; then
+				echolog "  - ${msg}不代理 TCP 端口[${TCP_NO_REDIR_PORTS}]"
+			else
+				unset LOCALHOST_TCP_PROXY_MODE
+				echolog "  - ${msg}不代理所有 TCP 端口"
+			fi
+		}
+		
+		[ "$UDP_NO_REDIR_PORTS" != "disable" ] && {
+			add_port_rules "$ipt_m -A PSW_OUTPUT -p udp" $UDP_NO_REDIR_PORTS "-j RETURN"
+			add_port_rules "$ip6t_m -A PSW_OUTPUT -p udp" $UDP_NO_REDIR_PORTS "-j RETURN"
+			if ! has_1_65535 "$UDP_NO_REDIR_PORTS"; then
+				echolog "  - ${msg}不代理 UDP 端口[${UDP_NO_REDIR_PORTS}]"
+			else
+				unset LOCALHOST_UDP_PROXY_MODE
+				echolog "  - ${msg}不代理所有 UDP 端口"
+			fi
+		}
+
+		if ([ -n "$TCP_NODE" ] && [ -n "${LOCALHOST_TCP_PROXY_MODE}" ]) || ([ -n "$UDP_NODE" ] && [ -n "${LOCALHOST_UDP_PROXY_MODE}" ]); then
+			[ -n "$DNS_REDIRECT_PORT" ] && {
+				$ipt_n -A OUTPUT $(comment "PSW_DNS") -p udp -o lo --dport 53 -j REDIRECT --to-ports $DNS_REDIRECT_PORT
+				$ip6t_n -A OUTPUT $(comment "PSW_DNS") -p udp -o lo --dport 53 -j REDIRECT --to-ports $DNS_REDIRECT_PORT 2>/dev/null
+				$ipt_n -A OUTPUT $(comment "PSW_DNS") -p tcp -o lo --dport 53 -j REDIRECT --to-ports $DNS_REDIRECT_PORT
+				$ip6t_n -A OUTPUT $(comment "PSW_DNS") -p tcp -o lo --dport 53 -j REDIRECT --to-ports $DNS_REDIRECT_PORT 2>/dev/null
+			}
+		fi
+
+		[ -n "${LOCALHOST_TCP_PROXY_MODE}" -o -n "${LOCALHOST_UDP_PROXY_MODE}" ] && {
+			[ "$TCP_PROXY_DROP_PORTS" != "disable" ] && {
+				add_port_rules "$ipt_m -A PSW_OUTPUT -p tcp" $TCP_PROXY_DROP_PORTS "-d $FAKE_IP -j DROP"
+				[ "${USE_PROXY_LIST}" = "1" ] && add_port_rules "$ipt_m -A PSW_OUTPUT -p tcp" $TCP_PROXY_DROP_PORTS "$(dst $IPSET_BLACK) -j DROP"
+				[ "${USE_GFW_LIST}" = "1" ] && add_port_rules "$ipt_m -A PSW_OUTPUT -p tcp" $TCP_PROXY_DROP_PORTS "$(dst $IPSET_GFW) -j DROP"
+				[ "${CHN_LIST}" != "0" ] && add_port_rules "$ipt_m -A PSW_OUTPUT -p tcp" $TCP_PROXY_DROP_PORTS "$(dst $IPSET_CHN) $(get_jump_ipt ${CHN_LIST} "-j DROP")"
+				[ "${USE_SHUNT_TCP}" = "1" ] && add_port_rules "$ipt_m -A PSW_OUTPUT -p tcp" $TCP_PROXY_DROP_PORTS "$(dst $IPSET_SHUNT) -j DROP"
+				[ "${LOCALHOST_TCP_PROXY_MODE}" != "disable" ] && add_port_rules "$ipt_m -A PSW_OUTPUT -p tcp" $TCP_PROXY_DROP_PORTS "-j DROP"
+				echolog "  - ${msg}屏蔽代理 TCP 端口[${TCP_PROXY_DROP_PORTS}]"
+			}
+			
+			[ "$UDP_PROXY_DROP_PORTS" != "disable" ] && {
+				add_port_rules "$ipt_m -A PSW_OUTPUT -p udp" $UDP_PROXY_DROP_PORTS "-d $FAKE_IP -j DROP"
+				[ "${USE_PROXY_LIST}" = "1" ] && add_port_rules "$ipt_m -A PSW_OUTPUT -p udp" $UDP_PROXY_DROP_PORTS "$(dst $IPSET_BLACK) -j DROP"
+				[ "${USE_GFW_LIST}" = "1" ] && add_port_rules "$ipt_m -A PSW_OUTPUT -p udp" $UDP_PROXY_DROP_PORTS "$(dst $IPSET_GFW) -j DROP"
+				[ "${CHN_LIST}" != "0" ] && add_port_rules "$ipt_m -A PSW_OUTPUT -p udp" $UDP_PROXY_DROP_PORTS "$(dst $IPSET_CHN) $(get_jump_ipt ${CHN_LIST} "-j DROP")"
+				[ "${USE_SHUNT_UDP}" = "1" ] && add_port_rules "$ipt_m -A PSW_OUTPUT -p udp" $UDP_PROXY_DROP_PORTS "$(dst $IPSET_SHUNT) -j DROP"
+				[ "${LOCALHOST_UDP_PROXY_MODE}" != "disable" ] && add_port_rules "$ipt_m -A PSW_OUTPUT -p udp" $UDP_PROXY_DROP_PORTS "-j DROP"
+				echolog "  - ${msg}屏蔽代理 UDP 端口[${UDP_PROXY_DROP_PORTS}]"
+			}
+		}
+
+		# 加载路由器自身代理 TCP
+		if [ -n "$TCP_NODE" ]; then
+			_proxy_tcp_access() {
+				[ -n "${2}" ] || return 0
+				if echo "${2}" | grep -q -v ':'; then
+					ipset -q test $IPSET_LAN ${2}
+					[ $? -eq 0 ] && {
+						echolog "  - 上游 DNS 服务器 ${2} 已在直接访问的列表中，不强制向 TCP 代理转发对该服务器 TCP/${3} 端口的访问"
+						return 0
+					}
+					if [ -z "${is_tproxy}" ]; then
+						$ipt_n -I PSW_OUTPUT -p tcp -d ${2} --dport ${3} $(REDIRECT $TCP_REDIR_PORT)
+					else
+						$ipt_m -I PSW_OUTPUT -p tcp -d ${2} --dport ${3} -j PSW_RULE
+						$ipt_m -I PSW $(comment "本机") -p tcp -i lo -d ${2} --dport ${3} $(REDIRECT $TCP_REDIR_PORT TPROXY)
+					fi
+					echolog "  - [$?]将上游 DNS 服务器 ${2}:${3} 加入到路由器自身代理的 TCP 转发链"
+				else
+					ipset -q test $IPSET_LAN6 ${2}
+					[ $? -eq 0 ] && {
+						echolog "  - 上游 DNS 服务器 ${2} 已在直接访问的列表中，不强制向 TCP 代理转发对该服务器 TCP/${3} 端口的访问"
+						return 0
+					}
+					$ip6t_m -I PSW_OUTPUT -p tcp -d ${2} --dport ${3} -j PSW_RULE
+					$ip6t_m -I PSW $(comment "本机") -p tcp -i lo -d ${2} --dport ${3} $(REDIRECT $TCP_REDIR_PORT TPROXY)
+					echolog "  - [$?]将上游 DNS 服务器 [${2}]:${3} 加入到路由器自身代理的 TCP 转发链，请确保您的节点支持IPv6，并开启IPv6透明代理！"
+				fi
+			}
+			[ -n "${TCP_PROXY_DNS}" ] && hosts_foreach REMOTE_DNS _proxy_tcp_access 53
+
+			[ "$accept_icmp" = "1" ] && {
+				$ipt_n -A OUTPUT -p icmp -j PSW_OUTPUT
+				$ipt_n -A PSW_OUTPUT -p icmp -d $FAKE_IP $(REDIRECT)
+				[ "${USE_PROXY_LIST}" = "1" ] && $ipt_n -A PSW_OUTPUT -p icmp $(dst $IPSET_BLACK) $(REDIRECT)
+				[ "${USE_GFW_LIST}" = "1" ] && $ipt_n -A PSW_OUTPUT -p icmp $(dst $IPSET_GFW) $(REDIRECT)
+				[ "${CHN_LIST}" != "0" ] && $ipt_n -A PSW_OUTPUT -p icmp $(dst $IPSET_CHN) $(get_jump_ipt ${CHN_LIST})
+				[ "${USE_SHUNT_TCP}" = "1" ] && $ipt_n -A PSW_OUTPUT -p icmp $(dst $IPSET_SHUNT) $(REDIRECT)
+				[ -n "${LOCALHOST_TCP_PROXY_MODE}" ] && [ "${LOCALHOST_TCP_PROXY_MODE}" != "disable" ] && $ipt_n -A PSW_OUTPUT -p icmp $(REDIRECT)
+			}
+
+			[ "$accept_icmpv6" = "1" ] && {
+				$ip6t_n -A OUTPUT -p ipv6-icmp -j PSW_OUTPUT
+				$ip6t_n -A PSW_OUTPUT -p ipv6-icmp -d $FAKE_IP_6 $(REDIRECT)
+				[ "${USE_PROXY_LIST}" = "1" ] && $ip6t_n -A PSW_OUTPUT -p ipv6-icmp $(dst $IPSET_BLACK6) $(REDIRECT)
+				[ "${USE_GFW_LIST}" = "1" ] && $ip6t_n -A PSW_OUTPUT -p ipv6-icmp $(dst $IPSET_GFW6) $(REDIRECT)
+				[ "${CHN_LIST}" != "0" ] && $ip6t_n -A PSW_OUTPUT -p ipv6-icmp $(dst $IPSET_CHN6) $(get_jump_ipt ${CHN_LIST})
+				[ "${USE_SHUNT_TCP}" = "1" ] && $ip6t_n -A PSW_OUTPUT -p ipv6-icmp $(dst $IPSET_SHUNT6) $(REDIRECT)
+				[ -n "${LOCALHOST_TCP_PROXY_MODE}" ] && [ "${LOCALHOST_TCP_PROXY_MODE}" != "disable" ] && $ip6t_n -A PSW_OUTPUT -p ipv6-icmp $(REDIRECT)
+			}
+
+			[ -n "${LOCALHOST_TCP_PROXY_MODE}" ] && {
+				$ipt_tmp -A PSW_OUTPUT -p tcp -d $FAKE_IP ${ipt_j}
+				[ "${USE_PROXY_LIST}" = "1" ] && add_port_rules "$ipt_tmp -A PSW_OUTPUT -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_BLACK) ${ipt_j}"
+				[ "${USE_GFW_LIST}" = "1" ] && add_port_rules "$ipt_tmp -A PSW_OUTPUT -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_GFW) ${ipt_j}"
+				[ "${CHN_LIST}" != "0" ] && add_port_rules "$ipt_tmp -A PSW_OUTPUT -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_CHN) $(get_jump_ipt ${CHN_LIST} "${ipt_j}")"
+				[ "${USE_SHUNT_TCP}" = "1" ] && add_port_rules "$ipt_tmp -A PSW_OUTPUT -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_SHUNT) ${ipt_j}"
+				[ "${LOCALHOST_TCP_PROXY_MODE}" != "disable" ] && add_port_rules "$ipt_tmp -A PSW_OUTPUT -p tcp" $TCP_REDIR_PORTS "${ipt_j}"
+				[ -n "${is_tproxy}" ] && $ipt_m -A PSW $(comment "本机") -p tcp -i lo $(REDIRECT $TCP_REDIR_PORT TPROXY)
+			}
+			[ -z "${is_tproxy}" ] && $ipt_n -A OUTPUT -p tcp -j PSW_OUTPUT
+			[ -n "${is_tproxy}" ] && {
+				$ipt_m -A PSW $(comment "本机") -p tcp -i lo -j RETURN
+				insert_rule_before "$ipt_m" "OUTPUT" "mwan3" "$(comment mangle-OUTPUT-PSW) -p tcp -j PSW_OUTPUT"
+			}
+
+			[ "$PROXY_IPV6" == "1" ] && {
+				[ -n "${LOCALHOST_TCP_PROXY_MODE}" ] && {
+					$ip6t_m -A PSW_OUTPUT -p tcp -d $FAKE_IP_6 -j PSW_RULE
+					[ "${USE_PROXY_LIST}" = "1" ] && add_port_rules "$ip6t_m -A PSW_OUTPUT -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_BLACK6) -j PSW_RULE"
+					[ "${USE_GFW_LIST}" = "1" ] && add_port_rules "$ip6t_m -A PSW_OUTPUT -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_GFW6) -j PSW_RULE"
+					[ "${CHN_LIST}" != "0" ] && add_port_rules "$ip6t_m -A PSW_OUTPUT -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_CHN6) $(get_jump_ipt ${CHN_LIST} "-j PSW_RULE")"
+					[ "${USE_SHUNT_TCP}" = "1" ] && add_port_rules "$ip6t_m -A PSW_OUTPUT -p tcp" $TCP_REDIR_PORTS "$(dst $IPSET_SHUNT6) -j PSW_RULE"
+					[ "${LOCALHOST_TCP_PROXY_MODE}" != "disable" ] && add_port_rules "$ip6t_m -A PSW_OUTPUT -p tcp" $TCP_REDIR_PORTS "-j PSW_RULE"
+					$ip6t_m -A PSW $(comment "本机") -p tcp -i lo $(REDIRECT $TCP_REDIR_PORT TPROXY)
+				}
+				$ip6t_m -A PSW $(comment "本机") -p tcp -i lo -j RETURN
+				insert_rule_before "$ip6t_m" "OUTPUT" "mwan3" "$(comment mangle-OUTPUT-PSW) -p tcp -j PSW_OUTPUT"
+			}
+		fi
+
+		# 加载路由器自身代理 UDP
+		if [ -n "$UDP_NODE" -o "$TCP_UDP" = "1" ]; then
+			_proxy_udp_access() {
+				[ -n "${2}" ] || return 0
+				if echo "${2}" | grep -q -v ':'; then
+					ipset -q test $IPSET_LAN ${2}
+					[ $? == 0 ] && {
+						echolog "  - 上游 DNS 服务器 ${2} 已在直接访问的列表中，不强制向 UDP 代理转发对该服务器 UDP/${3} 端口的访问"
+						return 0
+					}
+					$ipt_m -I PSW_OUTPUT -p udp -d ${2} --dport ${3} -j PSW_RULE
+					$ipt_m -I PSW $(comment "本机") -p udp -i lo -d ${2} --dport ${3} $(REDIRECT $UDP_REDIR_PORT TPROXY)
+					echolog "  - [$?]将上游 DNS 服务器 ${2}:${3} 加入到路由器自身代理的 UDP 转发链"
+				else
+					ipset -q test $IPSET_LAN6 ${2}
+					[ $? == 0 ] && {
+						echolog "  - 上游 DNS 服务器 ${2} 已在直接访问的列表中，不强制向 UDP 代理转发对该服务器 UDP/${3} 端口的访问"
+						return 0
+					}
+					$ip6t_m -I PSW_OUTPUT -p udp -d ${2} --dport ${3} -j PSW_RULE
+					$ip6t_m -I PSW $(comment "本机") -p udp -i lo -d ${2} --dport ${3} $(REDIRECT $UDP_REDIR_PORT TPROXY)
+					echolog "  - [$?]将上游 DNS 服务器 [${2}]:${3} 加入到路由器自身代理的 UDP 转发链，请确保您的节点支持IPv6，并开启IPv6透明代理！"
+				fi
+			}
+			[ -n "${UDP_PROXY_DNS}" ] && hosts_foreach REMOTE_DNS _proxy_udp_access 53
+			[ -n "${LOCALHOST_UDP_PROXY_MODE}" ] && {
+				$ipt_m -A PSW_OUTPUT -p udp -d $FAKE_IP -j PSW_RULE
+				[ "${USE_PROXY_LIST}" = "1" ] && add_port_rules "$ipt_m -A PSW_OUTPUT -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_BLACK) -j PSW_RULE"
+				[ "${USE_GFW_LIST}" = "1" ] && add_port_rules "$ipt_m -A PSW_OUTPUT -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_GFW) -j PSW_RULE"
+				[ "${CHN_LIST}" != "0" ] && add_port_rules "$ipt_m -A PSW_OUTPUT -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_CHN) $(get_jump_ipt ${CHN_LIST} "-j PSW_RULE")"
+				[ "${USE_SHUNT_UDP}" = "1" ] && add_port_rules "$ipt_m -A PSW_OUTPUT -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_SHUNT) -j PSW_RULE"
+				[ "${LOCALHOST_UDP_PROXY_MODE}" != "disable" ] && add_port_rules "$ipt_m -A PSW_OUTPUT -p udp" $UDP_REDIR_PORTS "-j PSW_RULE"
+				$ipt_m -A PSW $(comment "本机") -p udp -i lo $(REDIRECT $UDP_REDIR_PORT TPROXY)
+			}
+			$ipt_m -A PSW $(comment "本机") -p udp -i lo -j RETURN
+			insert_rule_before "$ipt_m" "OUTPUT" "mwan3" "$(comment mangle-OUTPUT-PSW) -p udp -j PSW_OUTPUT"
+
+			[ "$PROXY_IPV6" == "1" ] && {
+				[ -n "$LOCALHOST_UDP_PROXY_MODE" ] && {
+					$ip6t_m -A PSW_OUTPUT -p udp -d $FAKE_IP_6 -j PSW_RULE
+					[ "${USE_PROXY_LIST}" = "1" ] && add_port_rules "$ip6t_m -A PSW_OUTPUT -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_BLACK6) -j PSW_RULE"
+					[ "${USE_GFW_LIST}" = "1" ] && add_port_rules "$ip6t_m -A PSW_OUTPUT -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_GFW6) -j PSW_RULE"
+					[ "${CHN_LIST}" != "0" ] && add_port_rules "$ip6t_m -A PSW_OUTPUT -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_CHN6) $(get_jump_ipt ${CHN_LIST} "-j PSW_RULE")"
+					[ "${USE_SHUNT_UDP}" = "1" ] && add_port_rules "$ip6t_m -A PSW_OUTPUT -p udp" $UDP_REDIR_PORTS "$(dst $IPSET_SHUNT6) -j PSW_RULE"
+					[ "${LOCALHOST_UDP_PROXY_MODE}" != "disable" ] && add_port_rules "$ip6t_m -A PSW_OUTPUT -p udp" $UDP_REDIR_PORTS "-j PSW_RULE"
+					$ip6t_m -A PSW $(comment "本机") -p udp -i lo $(REDIRECT $UDP_REDIR_PORT TPROXY)
+				}
+				$ip6t_m -A PSW $(comment "本机") -p udp -i lo -j RETURN
+				insert_rule_before "$ip6t_m" "OUTPUT" "mwan3" "$(comment mangle-OUTPUT-PSW) -p udp -j PSW_OUTPUT"
+			}
+		fi
+
+		$ipt_m -I OUTPUT $(comment "mangle-OUTPUT-PSW") -o lo -j RETURN
+		insert_rule_before "$ipt_m" "OUTPUT" "mwan3" "$(comment mangle-OUTPUT-PSW) -m mark --mark 1 -j RETURN"
+		
+		$ip6t_m -I OUTPUT $(comment "mangle-OUTPUT-PSW") -o lo -j RETURN
+		insert_rule_before "$ip6t_m" "OUTPUT" "mwan3" "$(comment mangle-OUTPUT-PSW) -m mark --mark 1 -j RETURN"
+	}
+
+	#  加载ACLS
+	load_acl
+
+	[ -d "${TMP_IFACE_PATH}" ] && {
+		for iface in $(ls ${TMP_IFACE_PATH}); do
+			$ipt_n -I PSW_OUTPUT -o $iface -j RETURN
+			$ipt_m -I PSW_OUTPUT -o $iface -j RETURN
+		done
+	}
+
+	$ipt_n -I PREROUTING $(comment "PSW") -m mark --mark 1 -j RETURN
+	$ip6t_n -I PREROUTING $(comment "PSW") -m mark --mark 1 -j RETURN
+
+	filter_direct_node_list > /dev/null 2>&1 &
+
+	echolog "防火墙规则加载完成！"
+}
+
+del_firewall_rule() {
+	for ipt in "$ipt_n" "$ipt_m" "$ip6t_n" "$ip6t_m"; do
+		for chain in "PREROUTING" "OUTPUT"; do
+			for i in $(seq 1 $($ipt -nL $chain | grep -c PSW)); do
+				local index=$($ipt --line-number -nL $chain | grep PSW | head -1 | awk '{print $1}')
+				$ipt -D $chain $index 2>/dev/null
+			done
+		done
+		for chain in "PSW" "PSW_OUTPUT" "PSW_DIVERT" "PSW_DNS" "PSW_RULE"; do
+			$ipt -F $chain 2>/dev/null
+			$ipt -X $chain 2>/dev/null
+		done
+	done
+
+	ip rule del fwmark 1 lookup 100 2>/dev/null
+	ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null
+
+	ip -6 rule del fwmark 1 table 100 2>/dev/null
+	ip -6 route del local ::/0 dev lo table 100 2>/dev/null
+
+	destroy_ipset $IPSET_LOCAL
+	destroy_ipset $IPSET_LAN
+	destroy_ipset $IPSET_VPS
+	#destroy_ipset $IPSET_SHUNT
+	#destroy_ipset $IPSET_GFW
+	#destroy_ipset $IPSET_CHN
+	#destroy_ipset $IPSET_BLACK
+	destroy_ipset $IPSET_BLOCK
+	destroy_ipset $IPSET_WHITE
+
+	destroy_ipset $IPSET_LOCAL6
+	destroy_ipset $IPSET_LAN6
+	destroy_ipset $IPSET_VPS6
+	#destroy_ipset $IPSET_SHUNT6
+	#destroy_ipset $IPSET_GFW6
+	#destroy_ipset $IPSET_CHN6
+	#destroy_ipset $IPSET_BLACK6
+	destroy_ipset $IPSET_BLOCK6
+	destroy_ipset $IPSET_WHITE6
+
+	$DIR/app.sh echolog "删除 iptables 规则完成。"
+}
+
+flush_ipset() {
+	$DIR/app.sh echolog "清空 IPSet。"
+	for _name in $(ipset list | grep "Name: " | grep "passwall_" | awk '{print $2}'); do
+		destroy_ipset ${_name}
+	done
+}
+
+flush_include() {
+	echo '#!/bin/sh' >$FWI
+}
+
+gen_include() {
+	flush_include
+	extract_rules() {
+		local _ipt="${ipt}"
+		[ "$1" == "6" ] && _ipt="${ip6t}"
+		[ -z "${_ipt}" ] && return
+
+		echo "*$2"
+		${_ipt}-save -t $2 | grep "PSW" | grep -v "\-j PSW$" | grep -v "mangle\-OUTPUT\-PSW" | grep -v "socket \-j PSW_DIVERT$" | sed -e "s/^-A \(OUTPUT\|PREROUTING\)/-I \1 1/"
+		echo 'COMMIT'
+	}
+	local __ipt=""
+	[ -n "${ipt}" ] && {
+		__ipt=$(cat <<- EOF
+			mangle_output_psw=\$(${ipt}-save -t mangle | grep "PSW" | grep "mangle\-OUTPUT\-PSW" | sed "s#-A OUTPUT ##g")
+			$ipt-save -c | grep -v "PSW" | $ipt-restore -c
+			$ipt-restore -n <<-EOT
+			$(extract_rules 4 nat)
+			$(extract_rules 4 mangle)
+			EOT
+
+			echo "\${mangle_output_psw}" | while read line; do
+				\$(${MY_PATH} insert_rule_before "$ipt_m" "OUTPUT" "mwan3" "\${line}")
+			done
+
+			[ "$accept_icmp" = "1" ] && \$(${MY_PATH} insert_rule_after "$ipt_n" "PREROUTING" "prerouting_rule" "-p icmp -j PSW")
+			[ -z "${is_tproxy}" ] && \$(${MY_PATH} insert_rule_after "$ipt_n" "PREROUTING" "prerouting_rule" "-p tcp -j PSW")
+
+			\$(${MY_PATH} insert_rule_before "$ipt_m" "PREROUTING" "mwan3" "-j PSW")
+			\$(${MY_PATH} insert_rule_before "$ipt_m" "PREROUTING" "PSW" "-p tcp -m socket -j PSW_DIVERT")
+
+			WAN_IP=\$(${MY_PATH} get_wan_ip)
+
+			PR_INDEX=\$(${MY_PATH} RULE_LAST_INDEX "$ipt_n" PSW WAN_IP_RETURN -1)
+			if [ \$PR_INDEX -ge 0 ]; then
+				[ ! -z "\${WAN_IP}" ] && $ipt_n -R PSW \$PR_INDEX $(comment "WAN_IP_RETURN") -d "\${WAN_IP}" -j RETURN
+			fi
+
+			PR_INDEX=\$(${MY_PATH} RULE_LAST_INDEX "$ipt_m" PSW WAN_IP_RETURN -1)
+			if [ \$PR_INDEX -ge 0 ]; then
+				[ ! -z "\${WAN_IP}" ] && $ipt_m -R PSW \$PR_INDEX $(comment "WAN_IP_RETURN") -d "\${WAN_IP}" -j RETURN
+			fi
+		EOF
+		)
+	}
+	local __ip6t=""
+	[ -n "${ip6t}" ] && {
+		__ip6t=$(cat <<- EOF
+			mangle_output_psw=\$(${ip6t}-save -t mangle | grep "PSW" | grep "mangle\-OUTPUT\-PSW" | sed "s#-A OUTPUT ##g")
+			$ip6t-save -c | grep -v "PSW" | $ip6t-restore -c
+			$ip6t-restore -n <<-EOT
+			$(extract_rules 6 nat)
+			$(extract_rules 6 mangle)
+			EOT
+
+			echo "\${mangle_output_psw}" | while read line; do
+				\$(${MY_PATH} insert_rule_before "$ip6t_m" "OUTPUT" "mwan3" "\${line}")
+			done
+
+			[ "$accept_icmpv6" = "1" ] && $ip6t_n -A PREROUTING -p ipv6-icmp -j PSW
+
+			\$(${MY_PATH} insert_rule_before "$ip6t_m" "PREROUTING" "mwan3" "-j PSW")
+			\$(${MY_PATH} insert_rule_before "$ip6t_m" "PREROUTING" "PSW" "-p tcp -m socket -j PSW_DIVERT")
+
+			PR_INDEX=\$(${MY_PATH} RULE_LAST_INDEX "$ip6t_m" PSW WAN6_IP_RETURN -1)
+			if [ \$PR_INDEX -ge 0 ]; then
+				WAN6_IP=\$(${MY_PATH} get_wan6_ip)
+				[ ! -z "\${WAN6_IP}" ] && $ip6t_m -R PSW \$PR_INDEX $(comment "WAN6_IP_RETURN") -d "\${WAN6_IP}" -j RETURN
+			fi
+		EOF
+		)
+	}
+	cat <<-EOF >> $FWI
+		${__ipt}
+		
+		${__ip6t}
+
+		return 0
+	EOF
 	return 0
 }
 
-get_first_dns() {
-	local __hosts_val=${1}; shift 1
-	__first() {
-		[ -z "${2}" ] && return 0
-		echo "${2}#${3}"
-		return 1
-	}
-	eval "hosts_foreach \"${__hosts_val}\" __first \"$@\""
+get_ipt_bin() {
+	echo $ipt
 }
 
-get_last_dns() {
-	local __hosts_val=${1}; shift 1
-	local __first __last
-	__every() {
-		[ -z "${2}" ] && return 0
-		__last="${2}#${3}"
-		__first=${__first:-${__last}}
-	}
-	eval "hosts_foreach \"${__hosts_val}\" __every \"$@\""
-	[ "${__first}" ==  "${__last}" ] || echo "${__last}"
-}
-
-check_port_exists() {
-	local port=$1
-	local protocol=$2
-	[ -n "$protocol" ] || protocol="tcp,udp"
-	local result=
-	if [ "$protocol" = "tcp" ]; then
-		result=$(netstat -tln | grep -c ":$port ")
-	elif [ "$protocol" = "udp" ]; then
-		result=$(netstat -uln | grep -c ":$port ")
-	elif [ "$protocol" = "tcp,udp" ]; then
-		result=$(netstat -tuln | grep -c ":$port ")
-	fi
-	echo "${result}"
-}
-
-get_new_port() {
-	local port=$1
-	[ "$port" == "auto" ] && port=2082
-	local protocol=$(echo $2 | tr 'A-Z' 'a-z')
-	local result=$(check_port_exists $port $protocol)
-	if [ "$result" != 0 ]; then
-		local temp=
-		if [ "$port" -lt 65535 ]; then
-			temp=$(expr $port + 1)
-		elif [ "$port" -gt 1 ]; then
-			temp=$(expr $port - 1)
-		fi
-		get_new_port $temp $protocol
-	else
-		echo $port
-	fi
-}
-
-check_depends() {
-	local depends
-	local tables=${1}
-	local file_path="/usr/lib/opkg/info"
-	local file_ext=".control"
-	[ -d "/lib/apk/packages" ] && file_path="/lib/apk/packages" && file_ext=".list"
-	if [ "$tables" == "iptables" ]; then
-		for depends in "iptables-mod-tproxy" "iptables-mod-socket" "iptables-mod-iprange" "iptables-mod-conntrack-extra" "kmod-ipt-nat"; do
-			[ -s "${file_path}/${depends}${file_ext}" ] || echolog "$tables transparent proxy base dependency $depends is not installed..."
-		done
-	else
-		for depends in "kmod-nft-socket" "kmod-nft-tproxy" "kmod-nft-nat"; do
-			[ -s "${file_path}/${depends}${file_ext}" ] || echolog "$tables transparent proxy base dependency $depends is not installed..."
-		done
-	fi
-}
-
-check_ver() {
-	local version1="$1"
-	local version2="$2"
-	local i v1 v1_1 v1_2 v1_3 v2 v2_1 v2_2 v2_3
-	IFS='.'; set -- $version1; v1_1=${1:-0}; v1_2=${2:-0}; v1_3=${3:-0}
-	IFS='.'; set -- $version2; v2_1=${1:-0}; v2_2=${2:-0}; v2_3=${3:-0}
-	IFS=
-	for i in 1 2 3; do
-		eval v1=\$v1_$i
-		eval v2=\$v2_$i
-		if [ "$v1" -gt "$v2" ]; then
-			# version1 is greater than version2
-			echo 0
-			return
-		elif [ "$v1" -lt "$v2" ]; then
-			# version1 is less than version2
-			echo 1
-			return
-		fi
-	done
-	# version1 is equal to version2
-	echo 255
-}
-
-first_type() {
-	for p in "/bin/$1" "${TMP_BIN_PATH:-/tmp}/$1" "$1"; do
-		[ -x "$p" ] && echo "$p" && return
-	done
-	command -v "$1" 2>/dev/null || command -v "$2" 2>/dev/null
-}
-
-eval_set_val() {
-	for i in $@; do
-		for j in $i; do
-			eval $j
-		done
-	done
-}
-
-eval_unset_val() {
-	for i in $@; do
-		for j in $i; do
-			eval unset j
-		done
-	done
-}
-
-ln_run() {
-	local file_func=${1}
-	local ln_name=${2}
-	local output=${3}
-
-	shift 3;
-	if [  "${file_func%%/*}" != "${file_func}" ]; then
-		[ ! -L "${file_func}" ] && {
-			ln -s "${file_func}" "${TMP_BIN_PATH}/${ln_name}" >/dev/null 2>&1
-			file_func="${TMP_BIN_PATH}/${ln_name}"
-		}
-		[ -x "${file_func}" ] || echolog "  - $(readlink ${file_func}) does not have execute permission, cannot start: ${file_func} $*"
-	fi
-	#echo "${file_func} $*" >&2
-	[ -n "${file_func}" ] || echolog "  - ${ln_name} not found, cannot start..."
-	[ "${output}" != "/dev/null" ] && [ "${ln_name}" != "chinadns-ng" ] && {
-		local persist_log_path=$(config_t_get global persist_log_path)
-		local sys_log=$(config_t_get global sys_log "0")
-	}
-	if [ -z "$persist_log_path" ] && [ "$sys_log" != "1" ]; then
-		${file_func:-echolog " - ${ln_name}"} "$@" >${output} 2>&1 &
-	else
-		[ "${output: -1, -7}" == "TCP.log" ] && local protocol="TCP"
-		[ "${output: -1, -7}" == "UDP.log" ] && local protocol="UDP"
-		if [ -n "${persist_log_path}" ]; then
-			mkdir -p ${persist_log_path}
-			local log_file=${persist_log_path}/passwall_${protocol}_${ln_name}_$(date '+%F').log
-			echolog "Logging to persistent log file: ${log_file}"
-			${file_func:-echolog " - ${ln_name}"} "$@" >> ${log_file} 2>&1 &
-			sys_log=0
-		fi
-		if [ "${sys_log}" == "1" ]; then
-			echolog "Logging ${ln_name}_${protocol} to system log"
-			${file_func:-echolog " - ${ln_name}"} "$@" 2>&1 | logger -t PASSWALL_${protocol}_${ln_name} &
-		fi
-	fi
-	process_count=$(ls $TMP_SCRIPT_FUNC_PATH | wc -l)
-	process_count=$((process_count + 1))
-	echo "${file_func:-echolog "  - ${ln_name}"} $@ >${output}" > $TMP_SCRIPT_FUNC_PATH/$process_count
-}
-
-lua_api() {
-	local func=${1}
-	[ -z "${func}" ] && {
-		echo "nil"
-		return
-	}
-	echo $(lua -e "local api = require 'luci.passwall.api' print(api.${func})")
-}
-
-parse_doh() {
-	local __doh=$1 __url_var=$2 __host_var=$3 __port_var=$4 __bootstrap_var=$5
-	__doh=$(echo -e "$__doh" | tr -d ' \t\n')
-	local __url=${__doh%%,*}
-	local __bootstrap=${__doh#*,}
-	local __host_port=$(lua_api "get_domain_from_url(\"${__url}\")")
-	local __host __port
-	if echo "${__host_port}" | grep -q '^\[.*\]:[0-9]\+$'; then
-		__host=${__host_port%%]:*}]
-		__port=${__host_port##*:}
-	elif echo "${__host_port}" | grep -q ':[0-9]\+$'; then
-		__host=${__host_port%:*}
-		__port=${__host_port##*:}
-	else
-		__host=${__host_port}
-		__port=443
-	fi
-	__host=${__host#[}
-	__host=${__host%]}
-	if [ "$(lua_api "is_ip(\"${__host}\")")" = "true" ]; then
-		__bootstrap=${__host}
-	fi
-	__bootstrap=${__bootstrap#[}
-	__bootstrap=${__bootstrap%]}
-	eval "${__url_var}='${__url}' ${__host_var}='${__host}' ${__port_var}='${__port}' ${__bootstrap_var}='${__bootstrap}'"
-}
-
-get_geoip() {
-	local geoip_code="$1"
-	local geoip_type_flag=""
-	local geoip_path="${V2RAY_LOCATION_ASSET%*/}/geoip.dat"
-	[ -s "$geoip_path" ] || { echo ""; return 1; }
-	case "$2" in
-		"ipv4") geoip_type_flag="-ipv6=false" ;;
-		"ipv6") geoip_type_flag="-ipv4=false" ;;
-	esac
-	if type geoview &> /dev/null; then
-		geoview -input "$geoip_path" -list "$geoip_code" $geoip_type_flag -lowmem=true
-		return 0
-	else
-		echo ""
-		return 1
-	fi
-}
-
-set_cache_var() {
-	local key="${1}"
-	shift 1
-	local val="$@"
-	[ -n "${key}" ] && [ -n "${val}" ] && {
-		sed -i "/${key}=/d" $TMP_PATH/var >/dev/null 2>&1
-		echo "${key}=\"${val}\"" >> $TMP_PATH/var
-		eval ${key}=\"${val}\"
-	}
-}
-
-get_cache_var() {
-	local key="${1}"
-	[ -n "${key}" ] && [ -s "$TMP_PATH/var" ] && {
-		echo $(cat $TMP_PATH/var | grep "^${key}=" | awk -F '=' '{print $2}' | tail -n 1 | awk -F'"' '{print $2}')
-	}
-}
-
-eval_cache_var() {
-	[ -s "$TMP_PATH/var" ] && eval $(cat "$TMP_PATH/var")
-}
-
-has_1_65535() {
-	local val="$1"
-	val=${val//:/-}
-	case ",$val," in
-		*,1-65535,*) return 0 ;;
-		*) return 1 ;;
-	esac
-}
-
-run_ipt2socks() {
-	local flag proto tcp_tproxy local_port socks_address socks_port socks_username socks_password log_file
-	local _extra_param=""
-	eval_set_val $@
-	[ -n "$log_file" ] || log_file="/dev/null"
-	socks_address=$(get_host_ip "ipv4" ${socks_address})
-	[ -n "$socks_username" ] && [ -n "$socks_password" ] && _extra_param="${_extra_param} -a $socks_username -k $socks_password"
-	[ -n "$tcp_tproxy" ] || _extra_param="${_extra_param} -R"
-	case "$proto" in
-	UDP)
-		flag="${flag}_UDP"
-		_extra_param="${_extra_param} -U"
-	;;
-	TCP)
-		flag="${flag}_TCP"
-		_extra_param="${_extra_param} -T"
-	;;
-	*)
-		flag="${flag}_TCP_UDP"
-	;;
-	esac
-	_extra_param="${_extra_param} -o 60 -n 65535 -v"
-	ln_run "$(first_type ipt2socks)" "ipt2socks_${flag}" $log_file -l $local_port -b 0.0.0.0 -s $socks_address -p $socks_port ${_extra_param}
-}
-
-run_singbox() {
-	local flag type node tcp_redir_port tcp_proxy_way udp_redir_port socks_address socks_port socks_username socks_password http_address http_port http_username http_password
-	local dns_listen_port direct_dns_query_strategy direct_dns_port direct_dns_udp_server direct_dns_tcp_server remote_dns_protocol remote_dns_udp_server remote_dns_tcp_server remote_dns_doh remote_dns_client_ip remote_fakedns remote_dns_query_strategy dns_cache dns_socks_address dns_socks_port
-	local loglevel log_file config_file server_host server_port no_run
-	local _extra_param=""
-	eval_set_val $@
-	[ -z "$type" ] && {
-		local type=$(echo $(config_n_get $node type) | tr 'A-Z' 'a-z')
-		if [ "$type" != "sing-box" ]; then
-			bin=$(first_type $(config_t_get global_app sing_box_file) sing-box)
-			[ -n "$bin" ] && type="sing-box"
-		fi
-	}
-	[ -z "$type" ] && return 1
-	[ -n "$log_file" ] || local log_file="/dev/null"
-	_extra_param="${_extra_param} -log 1 -logfile ${log_file}"
-	if [ "$log_file" = "/dev/null" ]; then
-		_extra_param="${_extra_param} -log 0"
-	else
-		_extra_param="${_extra_param} -log 1 -logfile ${log_file}"
-	fi
-	[ -z "$loglevel" ] && local loglevel=$(config_t_get global loglevel "warn")
-	[ "$loglevel" = "warning" ] && loglevel="warn"
-	_extra_param="${_extra_param} -loglevel $loglevel"
-
-	[ -n "$flag" ] && _extra_param="${_extra_param} -flag $flag"
-	[ -n "$node" ] && _extra_param="${_extra_param} -node $node"
-	[ -n "$server_host" ] && _extra_param="${_extra_param} -server_host $server_host"
-	[ -n "$server_port" ] && _extra_param="${_extra_param} -server_port $server_port"
-	[ -n "$tcp_redir_port" ] && _extra_param="${_extra_param} -tcp_redir_port $tcp_redir_port"
-	[ -n "$tcp_proxy_way" ] && _extra_param="${_extra_param} -tcp_proxy_way $tcp_proxy_way"
-	[ -n "$udp_redir_port" ] && _extra_param="${_extra_param} -udp_redir_port $udp_redir_port"
-	[ -n "$socks_address" ] && _extra_param="${_extra_param} -local_socks_address $socks_address"
-	[ -n "$socks_port" ] && _extra_param="${_extra_param} -local_socks_port $socks_port"
-	[ -n "$socks_username" ] && [ -n "$socks_password" ] && _extra_param="${_extra_param} -local_socks_username $socks_username -local_socks_password $socks_password"
-	[ -n "$http_address" ] && _extra_param="${_extra_param} -local_http_address $http_address"
-	[ -n "$http_port" ] && _extra_param="${_extra_param} -local_http_port $http_port"
-	[ -n "$http_username" ] && [ -n "$http_password" ] && _extra_param="${_extra_param} -local_http_username $http_username -local_http_password $http_password"
-	[ -n "$dns_socks_address" ] && [ -n "$dns_socks_port" ] && _extra_param="${_extra_param} -dns_socks_address ${dns_socks_address} -dns_socks_port ${dns_socks_port}"
-	[ -n "$dns_listen_port" ] && _extra_param="${_extra_param} -dns_listen_port ${dns_listen_port}"
-	[ -n "$dns_cache" ] && _extra_param="${_extra_param} -dns_cache ${dns_cache}"
-
-	if [ -n "$direct_dns_udp_server" ]; then
-		direct_dns_port=$(echo ${direct_dns_udp_server} | awk -F '#' '{print $2}')
-		_extra_param="${_extra_param} -direct_dns_udp_server $(echo ${direct_dns_udp_server} | awk -F '#' '{print $1}')"
-	elif [ -n "$direct_dns_tcp_server" ]; then
-		direct_dns_port=$(echo ${direct_dns_tcp_server} | awk -F '#' '{print $2}')
-		_extra_param="${_extra_param} -direct_dns_tcp_server $(echo ${direct_dns_tcp_server} | awk -F '#' '{print $1}')"
-	else
-		local local_dns=$(echo -n $(echo "${LOCAL_DNS}" | sed "s/,/\n/g" | head -n1) | tr " " ",")
-		_extra_param="${_extra_param} -direct_dns_udp_server $(echo ${local_dns} | awk -F '#' '{print $1}')"
-		direct_dns_port=$(echo ${local_dns} | awk -F '#' '{print $2}')
-	fi
-	_extra_param="${_extra_param} -direct_dns_port ${direct_dns_port:-53}"
-	direct_dns_query_strategy=${direct_dns_query_strategy:-UseIP}
-	_extra_param="${_extra_param} -direct_dns_query_strategy ${direct_dns_query_strategy}"
-
-	[ -n "$remote_dns_query_strategy" ] && _extra_param="${_extra_param} -remote_dns_query_strategy ${remote_dns_query_strategy}"
-	case "$remote_dns_protocol" in
-		udp|tcp)
-			local _proto="$remote_dns_protocol"
-			local _dns=$(get_first_dns remote_dns_${_proto}_server 53 | sed 's/#/:/g')
-			local _dns_address=$(echo ${_dns} | awk -F ':' '{print $1}')
-			local _dns_port=$(echo ${_dns} | awk -F ':' '{print $2}')
-			_extra_param="${_extra_param} -remote_dns_server ${_dns_address} -remote_dns_port ${_dns_port} -remote_dns_${_proto}_server ${_proto}://${_dns}"
-		;;
-		doh)
-			local _doh_url _doh_host _doh_port _doh_bootstrap
-			parse_doh "$remote_dns_doh" _doh_url _doh_host _doh_port _doh_bootstrap
-			[ -n "$_doh_bootstrap" ] && _extra_param="${_extra_param} -remote_dns_server ${_doh_bootstrap}"
-			_extra_param="${_extra_param} -remote_dns_port ${_doh_port} -remote_dns_doh_url ${_doh_url} -remote_dns_doh_host ${_doh_host}"
-		;;
-	esac
-	[ -n "$remote_dns_client_ip" ] && _extra_param="${_extra_param} -remote_dns_client_ip ${remote_dns_client_ip}"
-	[ "$remote_fakedns" = "1" ] && _extra_param="${_extra_param} -remote_dns_fake 1"
-	[ -n "$no_run" ] && _extra_param="${_extra_param} -no_run 1"
-	lua $UTIL_SINGBOX gen_config ${_extra_param} > $config_file
-	[ -n "$no_run" ] || ln_run "$(first_type $(config_t_get global_app sing_box_file) sing-box)" "sing-box" $log_file run -c "$config_file"
-}
-
-run_xray() {
-	local flag type node tcp_redir_port tcp_proxy_way udp_redir_port socks_address socks_port socks_username socks_password http_address http_port http_username http_password
-	local dns_listen_port direct_dns_query_strategy direct_dns_port direct_dns_udp_server direct_dns_tcp_server remote_dns_protocol remote_dns_udp_server remote_dns_tcp_server remote_dns_doh remote_dns_client_ip remote_fakedns remote_dns_query_strategy dns_cache dns_socks_address dns_socks_port
-	local loglevel log_file config_file server_host server_port no_run
-	local _extra_param=""
-	eval_set_val $@
-	[ -z "$type" ] && {
-		local type=$(echo $(config_n_get $node type) | tr 'A-Z' 'a-z')
-		if [ "$type" != "xray" ]; then
-			bin=$(first_type $(config_t_get global_app xray_file) xray)
-			[ -n "$bin" ] && type="xray"
-		fi
-	}
-	[ -z "$type" ] && return 1
-	[ -n "$log_file" ] || local log_file="/dev/null"
-	[ -z "$loglevel" ] && local loglevel=$(config_t_get global loglevel "warning")
-	[ -n "$flag" ] && _extra_param="${_extra_param} -flag $flag"
-	[ -n "$node" ] && _extra_param="${_extra_param} -node $node"
-	[ -n "$server_host" ] && _extra_param="${_extra_param} -server_host $server_host"
-	[ -n "$server_port" ] && _extra_param="${_extra_param} -server_port $server_port"
-	[ -n "$tcp_redir_port" ] && _extra_param="${_extra_param} -tcp_redir_port $tcp_redir_port"
-	[ -n "$tcp_proxy_way" ] && _extra_param="${_extra_param} -tcp_proxy_way $tcp_proxy_way"
-	[ -n "$udp_redir_port" ] && _extra_param="${_extra_param} -udp_redir_port $udp_redir_port"
-	[ -n "$socks_address" ] && _extra_param="${_extra_param} -local_socks_address $socks_address"
-	[ -n "$socks_port" ] && _extra_param="${_extra_param} -local_socks_port $socks_port"
-	[ -n "$socks_username" ] && [ -n "$socks_password" ] && _extra_param="${_extra_param} -local_socks_username $socks_username -local_socks_password $socks_password"
-	[ -n "$http_address" ] && _extra_param="${_extra_param} -local_http_address $http_address"
-	[ -n "$http_port" ] && _extra_param="${_extra_param} -local_http_port $http_port"
-	[ -n "$http_username" ] && [ -n "$http_password" ] && _extra_param="${_extra_param} -local_http_username $http_username -local_http_password $http_password"
-	[ -n "$dns_socks_address" ] && [ -n "$dns_socks_port" ] && _extra_param="${_extra_param} -dns_socks_address ${dns_socks_address} -dns_socks_port ${dns_socks_port}"
-	[ -n "$dns_listen_port" ] && _extra_param="${_extra_param} -dns_listen_port ${dns_listen_port}"
-	
-	if [ -n "$direct_dns_udp_server" ]; then
-		direct_dns_port=$(echo ${direct_dns_udp_server} | awk -F '#' '{print $2}')
-		_extra_param="${_extra_param} -direct_dns_udp_server $(echo ${direct_dns_udp_server} | awk -F '#' '{print $1}')"
-	elif [ -n "$direct_dns_tcp_server" ]; then
-		direct_dns_port=$(echo ${direct_dns_tcp_server} | awk -F '#' '{print $2}')
-		_extra_param="${_extra_param} -direct_dns_tcp_server $(echo ${direct_dns_tcp_server} | awk -F '#' '{print $1}')"
-	else
-		local local_dns=$(echo -n $(echo "${LOCAL_DNS}" | sed "s/,/\n/g" | head -n1) | tr " " ",")
-		_extra_param="${_extra_param} -direct_dns_udp_server $(echo ${local_dns} | awk -F '#' '{print $1}')"
-		direct_dns_port=$(echo ${local_dns} | awk -F '#' '{print $2}')
-	fi
-	_extra_param="${_extra_param} -direct_dns_port ${direct_dns_port:-53}"
-
-	direct_dns_query_strategy=${direct_dns_query_strategy:-UseIP}
-	_extra_param="${_extra_param} -direct_dns_query_strategy ${direct_dns_query_strategy}"
-	[ -n "$remote_dns_query_strategy" ] && _extra_param="${_extra_param} -remote_dns_query_strategy ${remote_dns_query_strategy}"
-	[ -n "$remote_dns_client_ip" ] && _extra_param="${_extra_param} -remote_dns_client_ip ${remote_dns_client_ip}"
-	[ "$remote_fakedns" = "1" ] && _extra_param="${_extra_param} -remote_dns_fake 1"
-	[ -n "$dns_cache" ] && _extra_param="${_extra_param} -dns_cache ${dns_cache}"
-
-	case "$remote_dns_protocol" in
-		udp)
-			local _dns=$(get_first_dns remote_dns_udp_server 53 | sed 's/#/:/g')
-			local _dns_address=$(echo ${_dns} | awk -F ':' '{print $1}')
-			local _dns_port=$(echo ${_dns} | awk -F ':' '{print $2}')
-			_extra_param="${_extra_param} -remote_dns_udp_server ${_dns_address} -remote_dns_udp_port ${_dns_port}"
-		;;
-		tcp|tcp+doh)
-			local _dns=$(get_first_dns remote_dns_tcp_server 53 | sed 's/#/:/g')
-			local _dns_address=$(echo ${_dns} | awk -F ':' '{print $1}')
-			local _dns_port=$(echo ${_dns} | awk -F ':' '{print $2}')
-			_extra_param="${_extra_param} -remote_dns_tcp_server ${_dns_address} -remote_dns_tcp_port ${_dns_port}"
-			[ "$remote_dns_protocol" = "tcp+doh" ] && {
-				local _doh_url _doh_host _doh_port _doh_bootstrap
-				parse_doh "$remote_dns_doh" _doh_url _doh_host _doh_port _doh_bootstrap
-				[ -n "$_doh_bootstrap" ] && _extra_param="${_extra_param} -remote_dns_doh_ip ${_doh_bootstrap}"
-				_extra_param="${_extra_param} -remote_dns_doh_port ${_doh_port} -remote_dns_doh_url ${_doh_url} -remote_dns_doh_host ${_doh_host}"
-			}
-		;;
-	esac
-	_extra_param="${_extra_param} -loglevel $loglevel"
-	[ -n "$no_run" ] && _extra_param="${_extra_param} -no_run 1"
-	lua $UTIL_XRAY gen_config ${_extra_param} > $config_file
-	[ -n "$no_run" ] || ln_run "$(first_type $(config_t_get global_app ${type}_file) ${type})" ${type} $log_file run -c "$config_file"
-}
-
-run_dns2socks() {
-	local flag socks socks_address socks_port socks_username socks_password listen_address listen_port dns cache log_file
-	local _extra_param=""
-	eval_set_val $@
-	[ -n "$flag" ] && flag="_${flag}"
-	[ -n "$log_file" ] || log_file="/dev/null"
-	dns=$(get_first_dns dns 53 | sed 's/#/:/g')
-	[ -n "$socks" ] && {
-		socks="${socks//#/:}"
-		socks_address=$(echo $socks | awk -F ':' '{print $1}')
-		socks_port=$(echo $socks | awk -F ':' '{print $2}')
-	}
-	[ -n "$socks_username" ] && [ -n "$socks_password" ] && _extra_param="${_extra_param} /u $socks_username /p $socks_password"
-	[ -z "$cache" ] && cache=1
-	[ "$cache" = "0" ] && _extra_param="${_extra_param} /d"
-	ln_run "$(first_type dns2socks)" "dns2socks${flag}" $log_file ${_extra_param} "${socks_address}:${socks_port}" "${dns}" "${listen_address}:${listen_port}"
-}
-
-run_chinadns_ng() {
-	local _flag _listen_port _dns_local _dns_trust _no_ipv6_trust _use_direct_list _use_proxy_list _gfwlist _chnlist _default_mode _default_tag _no_logic_log _tcp_node _remote_fakedns
-	local _extra_param=""
-	eval_set_val $@
-
-	local _CONF_FILE=$TMP_ACL_PATH/$_flag/chinadns_ng.conf
-	local _LOG_FILE="/dev/null"
-	[ "$(config_t_get global log_chinadns_ng "0")" == "1" ] &&  _LOG_FILE=$TMP_ACL_PATH/$_flag/chinadns_ng.log
-
-	_extra_param="-FLAG ${_flag} -TCP_NODE ${_tcp_node} -LISTEN_PORT ${_listen_port} -DNS_LOCAL ${_dns_local} -DNS_TRUST ${_dns_trust}"
-	_extra_param="${_extra_param} -USE_DIRECT_LIST ${_use_direct_list} -USE_PROXY_LIST ${_use_proxy_list} -USE_BLOCK_LIST ${_use_block_list}"
-	_extra_param="${_extra_param} -GFWLIST ${_gfwlist} -CHNLIST ${_chnlist} -NO_IPV6_TRUST ${_no_ipv6_trust} -DEFAULT_MODE ${_default_mode}"
-	_extra_param="${_extra_param} -DEFAULT_TAG ${_default_tag} -NFTFLAG ${nftflag} -NO_LOGIC_LOG ${_no_logic_log} -REMOTE_FAKEDNS ${_remote_fakedns}"
-	_extra_param="${_extra_param} -LOG_FILE ${_LOG_FILE}"
-
-	lua $APP_PATH/helper_chinadns_add.lua ${_extra_param} > ${_CONF_FILE}
-	ln_run "$(first_type chinadns-ng)" chinadns-ng "${_LOG_FILE}" -C ${_CONF_FILE}
-}
-
-run_socks() {
-	local flag node bind socks_port config_file http_port http_config_file relay_port log_file no_run
-	eval_set_val $@
-	[ -n "$config_file" ] && [ -z "$(echo ${config_file} | grep $TMP_PATH)" ] && config_file=$TMP_PATH/$config_file
-	[ -n "$http_port" ] || http_port=0
-	[ -n "$http_config_file" ] && [ -z "$(echo ${http_config_file} | grep $TMP_PATH)" ] && http_config_file=$TMP_PATH/$http_config_file
-	if [ -n "$log_file" ] && [ -z "$(echo ${log_file} | grep $TMP_PATH)" ]; then
-		log_file=$TMP_PATH/$log_file
-	else
-		log_file="/dev/null"
-	fi
-	local type=$(echo $(config_n_get $node type) | tr 'A-Z' 'a-z')
-	local remarks=$(config_n_get $node remarks)
-	local server_host=$(config_n_get $node address)
-	local server_port=$(config_n_get $node port)
-	[ -n "$relay_port" ] && {
-		server_host="127.0.0.1"
-		server_port=$relay_port
-	}
-	local error_msg tmp
-
-	if [ -n "$server_host" ] && [ -n "$server_port" ]; then
-		check_host $server_host
-		[ $? != 0 ] && {
-			echolog "  - Socks node: [$remarks]${server_host} is an invalid server address, cannot start!"
-			return 1
-		}
-		tmp="${server_host}:${server_port}"
-	else
-		error_msg="For some reason, the configuration related to this Socks service is missing, startup aborted!"
-	fi
-
-	if [ "$type" == "sing-box" ] || [ "$type" == "xray" ]; then
-		local protocol=$(config_n_get $node protocol)
-		if [ "$protocol" == "_balancing" ] || [ "$protocol" == "_shunt" ] || [ "$protocol" == "_iface" ] || [ "$protocol" == "_urltest" ]; then
-			unset error_msg
-		fi
-	fi
-
-	[ -n "${error_msg}" ] && {
-		[ "$bind" != "127.0.0.1" ] && echolog "  - Socks node: [$remarks]${tmp}, startup aborted ${bind}:${socks_port} ${error_msg}"
-		return 1
-	}
-	[ "$bind" != "127.0.0.1" ] && echolog "  - Socks node: [$remarks]${tmp}, starting ${bind}:${socks_port}"
-
-	case "$type" in
-	socks)
-		local _socks_address=$(config_n_get $node address)
-		local _socks_port=$(config_n_get $node port)
-		local _socks_username=$(config_n_get $node username)
-		local _socks_password=$(config_n_get $node password)
-		[ "$http_port" != "0" ] && {
-			http_flag=1
-			config_file="${config_file//SOCKS/HTTP_SOCKS}"
-			local _extra_param="-local_http_address $bind -local_http_port $http_port"
-		}
-		local bin=$(first_type $(config_t_get global_app sing_box_file) sing-box)
-		if [ -n "$bin" ]; then
-			type="sing-box"
-			lua $UTIL_SINGBOX gen_proto_config -local_socks_address $bind -local_socks_port $socks_port ${_extra_param} -server_proto socks -server_address ${_socks_address} -server_port ${_socks_port} -server_username ${_socks_username} -server_password ${_socks_password} > $config_file
-			ln_run "$bin" ${type} $log_file run -c "$config_file"
-		else
-			bin=$(first_type $(config_t_get global_app xray_file) xray)
-			[ -n "$bin" ] && {
-				type="xray"
-				lua $UTIL_XRAY gen_proto_config -local_socks_address $bind -local_socks_port $socks_port ${_extra_param} -server_proto socks -server_address ${_socks_address} -server_port ${_socks_port} -server_username ${_socks_username} -server_password ${_socks_password} > $config_file
-				ln_run "$bin" ${type} $log_file run -c "$config_file"
-			}
-		fi
-	;;
-	sing-box)
-		[ "$http_port" != "0" ] && {
-			http_flag=1
-			config_file="${config_file//SOCKS/HTTP_SOCKS}"
-			local _args="http_address=$bind http_port=$http_port"
-		}
-		[ -n "$relay_port" ] && _args="${_args} server_host=$server_host server_port=$server_port"
-		[ -n "$no_run" ] && _args="${_args} no_run=1"
-		run_singbox flag=$flag node=$node socks_address=$bind socks_port=$socks_port config_file=$config_file log_file=$log_file ${_args}
-	;;
-	xray)
-		[ "$http_port" != "0" ] && {
-			http_flag=1
-			config_file="${config_file//SOCKS/HTTP_SOCKS}"
-			local _args="http_address=$bind http_port=$http_port"
-		}
-		[ -n "$relay_port" ] && _args="${_args} server_host=$server_host server_port=$server_port"
-		[ -n "$no_run" ] && _args="${_args} no_run=1"
-		run_xray flag=$flag node=$node socks_address=$bind socks_port=$socks_port config_file=$config_file log_file=$log_file ${_args}
-	;;
-	trojan*)
-		lua $UTIL_TROJAN gen_config -node $node -run_type client -local_addr $bind -local_port $socks_port -server_host $server_host -server_port $server_port > $config_file
-		[ -n "$no_run" ] || ln_run "$(first_type ${type})" "${type}" $log_file -c "$config_file"
-	;;
-	naiveproxy)
-		lua $UTIL_NAIVE gen_config -node $node -run_type socks -local_addr $bind -local_port $socks_port -server_host $server_host -server_port $server_port > $config_file
-		[ -n "$no_run" ] || ln_run "$(first_type naive)" naive $log_file "$config_file"
-	;;
-	ssr)
-		lua $UTIL_SS gen_config -node $node -local_addr $bind -local_port $socks_port -server_host $server_host -server_port $server_port > $config_file
-		[ -n "$no_run" ] || ln_run "$(first_type ssr-local)" "ssr-local" $log_file -c "$config_file" -v -u
-	;;
-	ss)
-		[ -n "$no_run" ] || {
-			local plugin_sh="${config_file%.json}_plugin.sh"
-			local _extra_param="-plugin_sh $plugin_sh"
-		}
-		lua $UTIL_SS gen_config -node $node -local_addr $bind -local_port $socks_port -server_host $server_host -server_port $server_port -mode tcp_and_udp ${_extra_param} > $config_file
-		[ -n "$no_run" ] || ln_run "$(first_type ss-local)" "ss-local" $log_file -c "$config_file" -v
-	;;
-	ss-rust)
-		local _extra_param
-		[ "$http_port" != "0" ] && {
-			http_flag=1
-			config_file="${config_file//SOCKS/HTTP_SOCKS}"
-			_extra_param="-local_http_address $bind -local_http_port $http_port"
-		}
-		[ -n "$no_run" ] || {
-			local plugin_sh="${config_file%.json}_plugin.sh"
-			_extra_param="${_extra_param:+$_extra_param }-plugin_sh $plugin_sh"
-		}
-		lua $UTIL_SS gen_config -node $node -local_socks_address $bind -local_socks_port $socks_port -server_host $server_host -server_port $server_port ${_extra_param} > $config_file
-		[ -n "$no_run" ] || ln_run "$(first_type sslocal)" "sslocal" $log_file -c "$config_file" -v
-	;;
-	hysteria2)
-		[ "$http_port" != "0" ] && {
-			http_flag=1
-			config_file="${config_file//SOCKS/HTTP_SOCKS}"
-			local _extra_param="-local_http_address $bind -local_http_port $http_port"
-		}
-		lua $UTIL_HYSTERIA2 gen_config -node $node -local_socks_address $bind -local_socks_port $socks_port -server_host $server_host -server_port $server_port ${_extra_param} > $config_file
-		[ -n "$no_run" ] || ln_run "$(first_type $(config_t_get global_app hysteria_file))" "hysteria" $log_file -c "$config_file" client
-	;;
-	tuic)
-		lua $UTIL_TUIC gen_config -node $node -local_addr $bind -local_port $socks_port -server_host $server_host -server_port $server_port > $config_file
-		[ -n "$no_run" ] || ln_run "$(first_type tuic-client)" "tuic-client" $log_file -c "$config_file"
-	;;
-	esac
-
-	set_cache_var "node_${node}_socks_port" "${socks_port}"
-
-	# http to socks
-	[ -z "$http_flag" ] && [ "$http_port" != "0" ] && [ -n "$http_config_file" ] && [ "$type" != "sing-box" ] && [ "$type" != "xray" ] && [ "$type" != "socks" ] && {
-		local bin=$(first_type $(config_t_get global_app sing_box_file) sing-box)
-		if [ -n "$bin" ]; then
-			type="sing-box"
-			lua $UTIL_SINGBOX gen_proto_config -local_http_address $bind -local_http_port $http_port -server_proto socks -server_address "127.0.0.1" -server_port $socks_port -server_username $_username -server_password $_password > $http_config_file
-			[ -n "$no_run" ] || ln_run "$bin" ${type} /dev/null run -c "$http_config_file"
-		else
-			bin=$(first_type $(config_t_get global_app xray_file) xray)
-			[ -n "$bin" ] && type="xray"
-			[ -z "$type" ] && return 1
-			lua $UTIL_XRAY gen_proto_config local_http_address $bind -local_http_port $http_port -server_proto socks -server_address "127.0.0.1" -server_port $socks_port -server_username $_username -server_password $_password > $http_config_file
-			[ -n "$no_run" ] || ln_run "$bin" ${type} /dev/null run -c "$http_config_file"
-		fi
-	}
-	unset http_flag
-
-	[ -z "$no_run" ] && [ "${server_host}" != "127.0.0.1" ] && [ "$type" != "sing-box" ] && [ "$type" != "xray" ] && echo "${node}" >> $TMP_PATH/direct_node_list
-}
-
-run_redir() {
-	local node proto bind local_port config_file log_file
-	eval_set_val $@
-	local tcp_node_socks_flag tcp_node_http_flag
-	[ -n "$config_file" ] && [ -z "$(echo ${config_file} | grep $TMP_PATH)" ] && config_file=${GLOBAL_ACL_PATH}/${config_file}
-	if [ -n "$log_file" ] && [ -z "$(echo ${log_file} | grep $TMP_PATH)" ]; then
-		log_file=${GLOBAL_ACL_PATH}/${log_file}
-	else
-		log_file="/dev/null"
-	fi
-	local proto=$(echo $proto | tr 'A-Z' 'a-z')
-	local PROTO=$(echo $proto | tr 'a-z' 'A-Z')
-	local type=$(echo $(config_n_get $node type) | tr 'A-Z' 'a-z')
-	local enable_log=$(config_t_get global log_${proto} 1)
-	[ "$enable_log" != "1" ] && log_file="/dev/null"
-	local remarks=$(config_n_get $node remarks)
-	local server_host=$(config_n_get $node address)
-	local port=$(config_n_get $node port)
-	[ -n "$server_host" ] && [ -n "$port" ] && {
-		check_host $server_host
-		[ $? != 0 ] && {
-			echolog "${PROTO} node: [$remarks]${server_host} is an invalid server address, cannot start!"
-			return 1
-		}
-	}
-	[ "$bind" != "127.0.0.1" ] && echolog "${PROTO} node: [$remarks], listening on port: $local_port"
-
-	case "$PROTO" in
-	UDP)
-		case "$type" in
-		socks)
-			local _socks_address=$(config_n_get $node address)
-			local _socks_port=$(config_n_get $node port)
-			local _socks_username=$(config_n_get $node username)
-			local _socks_password=$(config_n_get $node password)
-			run_ipt2socks flag=default proto=UDP local_port=${local_port} socks_address=${_socks_address} socks_port=${_socks_port} socks_username=${_socks_username} socks_password=${_socks_password} log_file=${log_file}
-		;;
-		sing-box)
-			local protocol=$(config_n_get $node protocol)
-			[ "$protocol" = "_shunt" ] && {
-				local geoip_path="${V2RAY_LOCATION_ASSET%*/}/geoip.dat"
-				local geosite_path="${V2RAY_LOCATION_ASSET%*/}/geosite.dat"
-				if [ ! -s "$geoip_path" ] || [ ! -s "$geosite_path" ]; then
-					echolog "* Missing Geo rule file, UDP Sing-Box shunt nodes cannot function properly!"
-				fi
-			}
-			run_singbox flag=UDP node=$node udp_redir_port=$local_port config_file=$config_file log_file=$log_file
-		;;
-		xray)
-			local protocol=$(config_n_get $node protocol)
-			[ "$protocol" = "_shunt" ] && {
-				local geoip_path="${V2RAY_LOCATION_ASSET%*/}/geoip.dat"
-				local geosite_path="${V2RAY_LOCATION_ASSET%*/}/geosite.dat"
-				if [ ! -s "$geoip_path" ] || [ ! -s "$geosite_path" ]; then
-					echolog "* Missing Geo rule file, UDP Xray shunt nodes cannot function properly!"
-				fi
-			}
-			run_xray flag=UDP node=$node udp_redir_port=$local_port config_file=$config_file log_file=$log_file
-		;;
-		trojan*)
-			local loglevel=$(config_t_get global trojan_loglevel "2")
-			lua $UTIL_TROJAN gen_config -node $node -run_type nat -local_addr "0.0.0.0" -local_port $local_port -loglevel $loglevel > $config_file
-			ln_run "$(first_type ${type})" "${type}" $log_file -c "$config_file"
-		;;
-		naiveproxy)
-			echolog "Naiveproxy does not support UDP forwarding!"
-		;;
-		ssr)
-			lua $UTIL_SS gen_config -node $node -local_addr "0.0.0.0" -local_port $local_port > $config_file
-			ln_run "$(first_type ssr-redir)" "ssr-redir" $log_file -c "$config_file" -v -U
-		;;
-		ss)
-			local plugin_sh="${config_file%.json}_plugin.sh"
-			local _extra_param="-plugin_sh $plugin_sh"
-			lua $UTIL_SS gen_config -node $node -local_addr "0.0.0.0" -local_port $local_port -mode udp_only $_extra_param > $config_file
-			ln_run "$(first_type ss-redir)" "ss-redir" $log_file -c "$config_file" -v
-		;;
-		ss-rust)
-			local plugin_sh="${config_file%.json}_plugin.sh"
-			local _extra_param="-plugin_sh $plugin_sh"
-			lua $UTIL_SS gen_config -node $node -local_udp_redir_port $local_port $_extra_param > $config_file
-			ln_run "$(first_type sslocal)" "sslocal" $log_file -c "$config_file" -v
-		;;
-		hysteria2)
-			lua $UTIL_HYSTERIA2 gen_config -node $node -local_udp_redir_port $local_port > $config_file
-			ln_run "$(first_type $(config_t_get global_app hysteria_file))" "hysteria" $log_file -c "$config_file" client
-		;;
-		tuic)
-			echolog "TUIC does not support UDP forwarding!"
-		;;
-		esac
-	;;
-	TCP)
-		[ "$TCP_UDP" = "1" ] && echolog "UDP node: same as TCP node"
-		tcp_node_socks=1
-		tcp_node_socks_bind_local=$(config_t_get global tcp_node_socks_bind_local 1)
-		tcp_node_socks_bind="127.0.0.1"
-		[ "${tcp_node_socks_bind_local}" != "1" ] && tcp_node_socks_bind="0.0.0.0"
-		tcp_node_socks_port=$(get_new_port $(config_t_get global tcp_node_socks_port 1070))
-		tcp_node_http_port=$(config_t_get global tcp_node_http_port 0)
-		[ "$tcp_node_http_port" != "0" ] && tcp_node_http=1
-		if [ $PROXY_IPV6 == "1" ]; then
-			echolog "Enable experimental IPv6 transparent proxy (TProxy), make sure your node and type support IPv6!"
-		fi
-
-		if [ "${TCP_PROXY_WAY}" = "redirect" ]; then
-			can_ipt=$(echo "$REDIRECT_LIST" | grep "$type")
-		elif [ "${TCP_PROXY_WAY}" = "tproxy" ]; then
-			can_ipt=$(echo "$TPROXY_LIST" | grep "$type")
-		fi
-		[ -z "$can_ipt" ] && type="socks"
-
-		case "$type" in
-		socks)
-			_socks_flag=1
-			_socks_address=$(config_n_get $node address)
-			_socks_port=$(config_n_get $node port)
-			_socks_username=$(config_n_get $node username)
-			_socks_password=$(config_n_get $node password)
-			[ -z "$can_ipt" ] && {
-				local _config_file=$config_file
-				_config_file="TCP_SOCKS_${node}.json"
-				local _port=$(get_new_port 2080)
-				run_socks flag="TCP" node=$node bind=127.0.0.1 socks_port=${_port} config_file=${_config_file}
-				_socks_address=127.0.0.1
-				_socks_port=${_port}
-				unset _socks_username
-				unset _socks_password
-			}
-		;;
-		sing-box)
-			local _flag="TCP"
-			local _args=""
-			[ "$tcp_node_socks" = "1" ] && {
-				tcp_node_socks_flag=1
-				_args="${_args} socks_address=${tcp_node_socks_bind} socks_port=${tcp_node_socks_port}"
-				config_file="${config_file//TCP/TCP_SOCKS}"
-			}
-			[ "$tcp_node_http" = "1" ] && {
-				tcp_node_http_flag=1
-				_args="${_args} http_port=${tcp_node_http_port}"
-				config_file="${config_file//TCP/TCP_HTTP}"
-			}
-			[ "$TCP_UDP" = "1" ] && {
-				UDP_REDIR_PORT=$local_port
-				unset UDP_NODE
-				_flag="TCP_UDP"
-				_args="${_args} udp_redir_port=${UDP_REDIR_PORT}"
-				config_file="${config_file//TCP/TCP_UDP}"
-			}
-
-			local protocol=$(config_n_get $node protocol)
-			local default_node=$(config_n_get $node default_node)
-			local v2ray_dns_mode=$(config_t_get global v2ray_dns_mode tcp)
-			[ "${DNS_MODE}" != "sing-box" ] && [ "${DNS_MODE}" != "udp" ] && [ "$protocol" = "_shunt" ] && [ "$default_node" = "_direct" ] && {
-				DNS_MODE="sing-box"
-				v2ray_dns_mode="tcp"
-				echolog "* The current TCP node uses Sing-Box shunt and the default node is direct. Remote DNS filter mode will default to Sing-Box (TCP) to prevent loopbacks!"
-			}
-
-			[ "$protocol" = "_shunt" ] && {
-				local geoip_path="${V2RAY_LOCATION_ASSET%*/}/geoip.dat"
-				local geosite_path="${V2RAY_LOCATION_ASSET%*/}/geosite.dat"
-				if [ ! -s "$geoip_path" ] || [ ! -s "$geosite_path" ]; then
-					echolog "* Missing Geo rule files, TCP Sing-Box shunt nodes cannot function properly!"
-				fi
-			}
-
-			[ "${DNS_MODE}" = "sing-box" ] && {
-				NO_PLUGIN_DNS=1
-				config_file="${config_file//.json/_DNS.json}"
-				_args="${_args} remote_dns_query_strategy=${REMOTE_DNS_QUERY_STRATEGY}"
-				DNSMASQ_FILTER_PROXY_IPV6=0
-				local _remote_dns_client_ip=$(config_t_get global remote_dns_client_ip)
-				[ -n "${_remote_dns_client_ip}" ] && _args="${_args} remote_dns_client_ip=${_remote_dns_client_ip}"
-				[ "${DNS_CACHE}" == "0" ] && _args="${_args} dns_cache=0"
-				resolve_dns_port=${NEXT_DNS_LISTEN_PORT}
-				_args="${_args} dns_listen_port=${resolve_dns_port}"
-
-				case "$(config_t_get global direct_dns_mode "auto")" in
-					udp)
-						_args="${_args} direct_dns_udp_server=$(config_t_get global direct_dns 223.5.5.5 | sed -E 's/^\[([^]]+)\]:(.*)$/\1#\2/; t; s/^([^:]+):([0-9]+)$/\1#\2/')"
-					;;
-					tcp)
-						_args="${_args} direct_dns_tcp_server=$(config_t_get global direct_dns 223.5.5.5 | sed -E 's/^\[([^]]+)\]:(.*)$/\1#\2/; t; s/^([^:]+):([0-9]+)$/\1#\2/')"
-					;;
-				esac
-
-				_args="${_args} remote_dns_protocol=${v2ray_dns_mode}"
-				case "$v2ray_dns_mode" in
-					udp|tcp)
-						local _proto="$v2ray_dns_mode"
-						_args="${_args} remote_dns_${_proto}_server=${REMOTE_DNS}"
-						resolve_dns_log="Sing-Box DNS(127.0.0.1#${resolve_dns_port}) -> ${_proto}://${REMOTE_DNS}"
-					;;
-					doh)
-						remote_dns_doh=$(config_t_get global remote_dns_doh "https://1.1.1.1/dns-query")
-						_args="${_args} remote_dns_doh=${remote_dns_doh}"
-						resolve_dns_log="Sing-Box DNS(127.0.0.1#${resolve_dns_port}) -> ${remote_dns_doh}"
-					;;
-				esac
-				local remote_fakedns=$(config_t_get global remote_fakedns 0)
-				[ "${remote_fakedns}" = "1" ] && {
-					fakedns=1
-					_args="${_args} remote_fakedns=1"
-					resolve_dns_log="${resolve_dns_log} + FakeDNS"
-				}
-				NEXT_DNS_LISTEN_PORT=$(expr $NEXT_DNS_LISTEN_PORT + 1)
-			}
-			run_singbox flag=$_flag node=$node tcp_redir_port=$local_port tcp_proxy_way=$TCP_PROXY_WAY config_file=$config_file log_file=$log_file ${_args}
-		;;
-		xray)
-			local _flag="TCP"
-			local _args=""
-			[ "$tcp_node_socks" = "1" ] && {
-				tcp_node_socks_flag=1
-				_args="${_args} socks_address=${tcp_node_socks_bind} socks_port=${tcp_node_socks_port}"
-				config_file="${config_file//TCP/TCP_SOCKS}"
-			}
-			[ "$tcp_node_http" = "1" ] && {
-				tcp_node_http_flag=1
-				_args="${_args} http_port=${tcp_node_http_port}"
-				config_file="${config_file//TCP/TCP_HTTP}"
-			}
-			[ "$TCP_UDP" = "1" ] && {
-				UDP_REDIR_PORT=$local_port
-				unset UDP_NODE
-				_flag="TCP_UDP"
-				_args="${_args} udp_redir_port=${UDP_REDIR_PORT}"
-				config_file="${config_file//TCP/TCP_UDP}"
-			}
-
-			local protocol=$(config_n_get $node protocol)
-			local default_node=$(config_n_get $node default_node)
-			local v2ray_dns_mode=$(config_t_get global v2ray_dns_mode tcp)
-			[ "${DNS_MODE}" != "xray" ] && [ "${DNS_MODE}" != "udp" ] && [ "$protocol" = "_shunt" ] && [ "$default_node" = "_direct" ] && {
-				DNS_MODE="xray"
-				v2ray_dns_mode="tcp"
-				echolog "* The current TCP node uses Xray shunt and the default node is direct. Remote DNS filter mode will default to Xray (TCP) to prevent loopbacks!"
-			}
-
-			[ "$protocol" = "_shunt" ] && {
-				local geoip_path="${V2RAY_LOCATION_ASSET%*/}/geoip.dat"
-				local geosite_path="${V2RAY_LOCATION_ASSET%*/}/geosite.dat"
-				if [ ! -s "$geoip_path" ] || [ ! -s "$geosite_path" ]; then
-					echolog "* Missing Geo rule files, TCP Xray shunt nodes cannot function properly!"
-				fi
-			}
-
-			[ "${DNS_MODE}" = "xray" ] && {
-				NO_PLUGIN_DNS=1
-				config_file="${config_file//.json/_DNS.json}"
-				_args="${_args} remote_dns_query_strategy=${REMOTE_DNS_QUERY_STRATEGY}"
-				DNSMASQ_FILTER_PROXY_IPV6=0
-				local _remote_dns_client_ip=$(config_t_get global remote_dns_client_ip)
-				[ -n "${_remote_dns_client_ip}" ] && _args="${_args} remote_dns_client_ip=${_remote_dns_client_ip}"
-				[ "${DNS_CACHE}" == "0" ] && _args="${_args} dns_cache=0"
-				resolve_dns_port=${NEXT_DNS_LISTEN_PORT}
-				_args="${_args} dns_listen_port=${resolve_dns_port}"
-
-				case "$(config_t_get global direct_dns_mode "auto")" in
-					udp)
-						_args="${_args} direct_dns_udp_server=$(config_t_get global direct_dns 223.5.5.5 | sed -E 's/^\[([^]]+)\]:(.*)$/\1#\2/; t; s/^([^:]+):([0-9]+)$/\1#\2/')"
-					;;
-					tcp)
-						_args="${_args} direct_dns_tcp_server=$(config_t_get global direct_dns 223.5.5.5 | sed -E 's/^\[([^]]+)\]:(.*)$/\1#\2/; t; s/^([^:]+):([0-9]+)$/\1#\2/')"
-					;;
-				esac
-
-				_args="${_args} remote_dns_protocol=${v2ray_dns_mode}"
-				case "$v2ray_dns_mode" in
-					udp)
-						_args="${_args} remote_dns_udp_server=${REMOTE_DNS}"
-						resolve_dns_log="Xray DNS(127.0.0.1#${resolve_dns_port}) -> udp://${REMOTE_DNS}"
-					;;
-					tcp|tcp+doh)
-						_args="${_args} remote_dns_tcp_server=${REMOTE_DNS}"
-						if [ "$v2ray_dns_mode" = "tcp+doh" ]; then
-							remote_dns_doh=$(config_t_get global remote_dns_doh "https://1.1.1.1/dns-query")
-							_args="${_args} remote_dns_doh=${remote_dns_doh}"
-							resolve_dns_log="Xray DNS(127.0.0.1#${resolve_dns_port}) -> (${remote_dns_doh})(A/AAAA) + tcp://${REMOTE_DNS}"
-						else
-							resolve_dns_log="Xray DNS(127.0.0.1#${resolve_dns_port}) -> tcp://${REMOTE_DNS}"
-						fi
-					;;
-				esac
-				local remote_fakedns=$(config_t_get global remote_fakedns 0)
-				[ "${remote_fakedns}" = "1" ] && {
-					fakedns=1
-					_args="${_args} remote_fakedns=1"
-					resolve_dns_log="${resolve_dns_log} + FakeDNS"
-				}
-				NEXT_DNS_LISTEN_PORT=$(expr $NEXT_DNS_LISTEN_PORT + 1)
-			}
-			run_xray flag=$_flag node=$node tcp_redir_port=$local_port tcp_proxy_way=$TCP_PROXY_WAY config_file=$config_file log_file=$log_file ${_args}
-		;;
-		trojan*)
-			[ "${TCP_PROXY_WAY}" = "tproxy" ] && lua_tproxy_arg="-use_tproxy true"
-			[ "$TCP_UDP" = "1" ] && {
-				config_file="${config_file//TCP/TCP_UDP}"
-				UDP_REDIR_PORT=$TCP_REDIR_PORT
-				unset UDP_NODE
-			}
-			local loglevel=$(config_t_get global trojan_loglevel "2")
-			lua $UTIL_TROJAN gen_config -node $node -run_type nat -local_addr "0.0.0.0" -local_port $local_port -loglevel $loglevel $lua_tproxy_arg > $config_file
-			ln_run "$(first_type ${type})" "${type}" $log_file -c "$config_file"
-		;;
-		naiveproxy)
-			lua $UTIL_NAIVE gen_config -node $node -run_type redir -local_addr "0.0.0.0" -local_port $local_port > $config_file
-			ln_run "$(first_type naive)" naive $log_file "$config_file"
-		;;
-		ssr)
-			[ "${TCP_PROXY_WAY}" = "tproxy" ] && lua_tproxy_arg="-tcp_tproxy true"
-			[ "$TCP_UDP" = "1" ] && {
-				config_file="${config_file//TCP/TCP_UDP}"
-				UDP_REDIR_PORT=$TCP_REDIR_PORT
-				unset UDP_NODE
-				_extra_param="-u"
-			}
-			lua $UTIL_SS gen_config -node $node -local_addr "0.0.0.0" -local_port $local_port $lua_tproxy_arg > $config_file
-			ln_run "$(first_type ssr-redir)" "ssr-redir" $log_file -c "$config_file" -v ${_extra_param}
-		;;
-		ss)
-			[ "${TCP_PROXY_WAY}" = "tproxy" ] && lua_tproxy_arg="-tcp_tproxy true"
-			local lua_mode_arg="-mode tcp_only"
-			[ "$TCP_UDP" = "1" ] && {
-				config_file="${config_file//TCP/TCP_UDP}"
-				UDP_REDIR_PORT=$TCP_REDIR_PORT
-				unset UDP_NODE
-				lua_mode_arg="-mode tcp_and_udp"
-			}
-			local plugin_sh="${config_file%.json}_plugin.sh"
-			lua_mode_arg="${lua_mode_arg} -plugin_sh $plugin_sh"
-			lua $UTIL_SS gen_config -node $node -local_addr "0.0.0.0" -local_port $local_port $lua_mode_arg $lua_tproxy_arg > $config_file
-			ln_run "$(first_type ss-redir)" "ss-redir" $log_file -c "$config_file" -v
-		;;
-		ss-rust)
-			local _extra_param="-local_tcp_redir_port $local_port"
-			[ "${TCP_PROXY_WAY}" = "tproxy" ] && _extra_param="${_extra_param} -tcp_tproxy true"
-			[ "$tcp_node_socks" = "1" ] && {
-				tcp_node_socks_flag=1
-				config_file="${config_file//TCP/TCP_SOCKS}"
-				_extra_param="${_extra_param} -local_socks_address ${tcp_node_socks_bind} -local_socks_port ${tcp_node_socks_port}"
-			}
-			[ "$tcp_node_http" = "1" ] && {
-				tcp_node_http_flag=1
-				config_file="${config_file//TCP/TCP_HTTP}"
-				_extra_param="${_extra_param} -local_http_port ${tcp_node_http_port}"
-			}
-			[ "$TCP_UDP" = "1" ] && {
-				config_file="${config_file//TCP/TCP_UDP}"
-				UDP_REDIR_PORT=$TCP_REDIR_PORT
-				unset UDP_NODE
-				_extra_param="${_extra_param} -local_udp_redir_port $local_port"
-			}
-			local plugin_sh="${config_file%.json}_plugin.sh"
-			_extra_param="${_extra_param} -plugin_sh $plugin_sh"
-			lua $UTIL_SS gen_config -node $node ${_extra_param} > $config_file
-			ln_run "$(first_type sslocal)" "sslocal" $log_file -c "$config_file" -v
-		;;
-		hysteria2)
-			local _extra_param="-local_tcp_redir_port $local_port"
-			[ "$tcp_node_socks" = "1" ] && {
-				tcp_node_socks_flag=1
-				config_file="${config_file//TCP/TCP_SOCKS}"
-				_extra_param="${_extra_param} -local_socks_address ${tcp_node_socks_bind} -local_socks_port ${tcp_node_socks_port}"
-			}
-			[ "$tcp_node_http" = "1" ] && {
-				tcp_node_http_flag=1
-				config_file="${config_file//TCP/TCP_HTTP}"
-				_extra_param="${_extra_param} -local_http_port ${tcp_node_http_port}"
-			}
-			[ "$TCP_UDP" = "1" ] && {
-				config_file="${config_file//TCP/TCP_UDP}"
-				UDP_REDIR_PORT=$TCP_REDIR_PORT
-				unset UDP_NODE
-				_extra_param="${_extra_param} -local_udp_redir_port $local_port"
-			}
-			_extra_param="${_extra_param} -tcp_proxy_way ${TCP_PROXY_WAY}"
-			lua $UTIL_HYSTERIA2 gen_config -node $node ${_extra_param} > $config_file
-			ln_run "$(first_type $(config_t_get global_app hysteria_file))" "hysteria" $log_file -c "$config_file" client
-		;;
-		esac
-		if [ -n "${_socks_flag}" ]; then
-			local _flag="TCP"
-			[ "$TCP_UDP" = "1" ] && {
-				_flag="TCP_UDP"
-				UDP_REDIR_PORT=$TCP_REDIR_PORT
-				unset UDP_NODE
-			}
-			local _socks_tproxy=""
-			[ "${TCP_PROXY_WAY}" = "tproxy" ] && _socks_tproxy="1"
-			run_ipt2socks flag=default proto=${_flag} tcp_tproxy=${_socks_tproxy} local_port=${local_port} socks_address=${_socks_address} socks_port=${_socks_port} socks_username=${_socks_username} socks_password=${_socks_password} log_file=${log_file}
-		fi
-
-		[ -z "$tcp_node_socks_flag" ] && {
-			[ "$tcp_node_socks" = "1" ] && {
-				local config_file="SOCKS_TCP.json"
-				local log_file="SOCKS_TCP.log"
-				local http_port=0
-				local http_config_file="HTTP2SOCKS_TCP.json"
-				[ "$tcp_node_http" = "1" ] && [ -z "$tcp_node_http_flag" ] && {
-					http_port=$tcp_node_http_port
-				}
-				run_socks flag=TCP node=$node bind=$tcp_node_socks_bind socks_port=$tcp_node_socks_port config_file=$config_file http_port=$http_port http_config_file=$http_config_file
-			}
-		}
-
-		[ "$tcp_node_socks" = "1" ] && {
-			TCP_SOCKS_server="127.0.0.1:$tcp_node_socks_port"
-			set_cache_var "GLOBAL_TCP_SOCKS_server" "${TCP_SOCKS_server}"
-		}
-	;;
-	esac
-	unset tcp_node_socks_flag tcp_node_http_flag
-	[ "$type" != "sing-box" ] && [ "$type" != "xray" ] && echo "${node}" >> $TMP_PATH/direct_node_list
-	[ -n "${redir_port}" ] && set_cache_var "node_${node}_${PROTO}_redir_port" "${local_port}"
-}
-
-start_redir() {
-	local proto=${1}
-	eval node=\$${proto}_NODE
-	if [ -n "$node" ]; then
-		TYPE=$(echo $(config_n_get $node type) | tr 'A-Z' 'a-z')
-		local config_file="${proto}.json"
-		local log_file="${proto}.log"
-		eval current_port=\$${proto}_REDIR_PORT
-		local port=$(echo $(get_new_port $current_port $proto))
-		eval ${proto}_REDIR_PORT=$port
-		run_redir node=$node proto=${proto} bind=0.0.0.0 local_port=$port config_file=$config_file log_file=$log_file
-		set_cache_var "ACL_GLOBAL_${proto}_node" "${node}"
-		set_cache_var "ACL_GLOBAL_${proto}_redir_port" "${port}"
-		[ "$TCP_UDP" = "1" ] && {
-			set_cache_var "ACL_GLOBAL_UDP_node" "${node}"
-			set_cache_var "ACL_GLOBAL_UDP_redir_port" "${port}"
-		}
-	else
-		[ "${proto}" = "UDP" ] && [ "$TCP_UDP" = "1" ] && return
-		echolog "${proto} node is not selected or empty, ${proto} will not be proxied."
-	fi
-}
-
-start_socks() {
-	[ "$SOCKS_ENABLED" = "1" ] && {
-		local ids=$(uci show $CONFIG | grep "=socks" | awk -F '.' '{print $2}' | awk -F '=' '{print $1}')
-		[ -n "$ids" ] && {
-			echolog "Analyzing node configuration for the Socks service..."
-			for id in $ids; do
-				local enabled=$(config_n_get $id enabled 0)
-				[ "$enabled" == "0" ] && continue
-				local node=$(config_n_get $id node)
-				[ -z "$node" ] && continue
-				local bind_local=$(config_n_get $id bind_local 0)
-				local bind="0.0.0.0"
-				[ "$bind_local" = "1" ] && bind="127.0.0.1"
-				local port=$(config_n_get $id port)
-				local config_file="SOCKS_${id}.json"
-				local log_file="SOCKS_${id}.log"
-				local log=$(config_n_get $id log 1)
-				[ "$log" == "0" ] && log_file=""
-				local http_port=$(config_n_get $id http_port 0)
-				local http_config_file="HTTP2SOCKS_${id}.json"
-				run_socks flag=$id node=$node bind=$bind socks_port=$port config_file=$config_file http_port=$http_port http_config_file=$http_config_file log_file=$log_file
-				set_cache_var "socks_${id}" "$node"
-
-				# Auto-switch logic
-				local enable_autoswitch=$(config_n_get $id enable_autoswitch 0)
-				[ "$enable_autoswitch" = "1" ] && $APP_PATH/socks_auto_switch.sh ${id} > /dev/null 2>&1 &
-			done
-		}
-	}
-}
-
-socks_node_switch() {
-	local flag new_node
-	eval_set_val $@
-	[ -n "$flag" ] && [ -n "$new_node" ] && {
-		local prefix pf filename
-		# 结束 SS 插件进程
-		for prefix in "" "HTTP_"; do
-			pf="$TMP_PATH/${prefix}SOCKS_${flag}_plugin.pid"
-			[ -s "$pf" ] && kill -9 "$(head -n1 "$pf")" >/dev/null 2>&1
-		done
-
-		pgrep -af "$TMP_BIN_PATH" | awk -v P1="${flag}" 'BEGIN{IGNORECASE=1}$0~P1 && !/acl\/|acl_/{print $1}' | xargs kill -9 >/dev/null 2>&1
-		for prefix in "" "HTTP_" "HTTP2"; do
-			rm -rf "$TMP_PATH/${prefix}SOCKS_${flag}"*
-		done
-
-		for filename in $(ls ${TMP_SCRIPT_FUNC_PATH}); do
-			cmd=$(cat ${TMP_SCRIPT_FUNC_PATH}/${filename})
-			[ -n "$(echo $cmd | grep "${flag}")" ] && rm -f ${TMP_SCRIPT_FUNC_PATH}/${filename}
-		done
-		local bind_local=$(config_n_get $flag bind_local 0)
-		local bind="0.0.0.0"
-		[ "$bind_local" = "1" ] && bind="127.0.0.1"
-		local port=$(config_n_get $flag port)
-		local config_file="SOCKS_${flag}.json"
-		local log_file="SOCKS_${flag}.log"
-		local log=$(config_n_get $flag log 1)
-		[ "$log" == "0" ] && log_file=""
-		local http_port=$(config_n_get $flag http_port 0)
-		local http_config_file="HTTP2SOCKS_${flag}.json"
-		LOG_FILE="/dev/null"
-		run_socks flag=$flag node=$new_node bind=$bind socks_port=$port config_file=$config_file http_port=$http_port http_config_file=$http_config_file log_file=$log_file
-		set_cache_var "socks_${flag}" "$new_node"
-		local USE_TABLES=$(get_cache_var "USE_TABLES")
-		[ -n "$USE_TABLES" ] && source $APP_PATH/${USE_TABLES}.sh filter_direct_node_list
-	}
-}
-
-clean_log() {
-	logsnum=$(cat $LOG_FILE 2>/dev/null | wc -l)
-	[ "$logsnum" -gt 1000 ] && {
-		echo "" > $LOG_FILE
-		echolog "日志文件过长，清空处理！"
-	}
-}
-
-clean_crontab() {
-	[ -f "/tmp/lock/${CONFIG}_cron.lock" ] && return
-	touch /etc/crontabs/root
-	#sed -i "/${CONFIG}/d" /etc/crontabs/root >/dev/null 2>&1
-	sed -i "/$(echo "/etc/init.d/${CONFIG}" | sed 's#\/#\\\/#g')/d" /etc/crontabs/root >/dev/null 2>&1
-	sed -i "/$(echo "lua ${APP_PATH}/rule_update.lua log" | sed 's#\/#\\\/#g')/d" /etc/crontabs/root >/dev/null 2>&1
-	sed -i "/$(echo "lua ${APP_PATH}/subscribe.lua start" | sed 's#\/#\\\/#g')/d" /etc/crontabs/root >/dev/null 2>&1
-
-	pgrep -af "${CONFIG}/" | awk '/tasks\.sh/{print $1}' | xargs kill -9 >/dev/null 2>&1
-	rm -rf /tmp/lock/${CONFIG}_tasks.lock
-}
-
-start_crontab() {
-	if [ "$ENABLED_DEFAULT_ACL" == 1 ] || [ "$ENABLED_ACLS" == 1 ]; then
-		start_daemon=$(config_t_get global_delay start_daemon 0)
-		[ "$start_daemon" = "1" ] && $APP_PATH/monitor.sh > /dev/null 2>&1 &
-	fi
-
-	[ -f "/tmp/lock/${CONFIG}_cron.lock" ] && {
-		rm -rf "/tmp/lock/${CONFIG}_cron.lock"
-		echolog "当前为计划任务自动运行，不重新配置定时任务。"
-		return
-	}
-
-	clean_crontab
-
-	[ "$ENABLED" != 1 ] && {
-		/etc/init.d/cron restart
-		return
-	}
-
-	stop_week_mode=$(config_t_get global_delay stop_week_mode)
-	stop_time_mode=$(config_t_get global_delay stop_time_mode)
-	if [ -n "$stop_week_mode" ]; then
-		local t="0 $stop_time_mode * * $stop_week_mode"
-		[ "$stop_week_mode" = "7" ] && t="0 $stop_time_mode * * *"
-		if [ "$stop_week_mode" = "8" ]; then
-			update_loop=1
-		else
-			echo "$t /etc/init.d/$CONFIG stop > /dev/null 2>&1 &" >>/etc/crontabs/root
-		fi
-		echolog "配置定时任务：自动关闭服务。"
-	fi
-	start_week_mode=$(config_t_get global_delay start_week_mode)
-	start_time_mode=$(config_t_get global_delay start_time_mode)
-	if [ -n "$start_week_mode" ]; then
-		local t="0 $start_time_mode * * $start_week_mode"
-		[ "$start_week_mode" = "7" ] && t="0 $start_time_mode * * *"
-		if [ "$start_week_mode" = "8" ]; then
-			update_loop=1
-		else
-			echo "$t /etc/init.d/$CONFIG start > /dev/null 2>&1 &" >>/etc/crontabs/root
-		fi
-		echolog "配置定时任务：自动开启服务。"
-	fi
-	restart_week_mode=$(config_t_get global_delay restart_week_mode)
-	restart_time_mode=$(config_t_get global_delay restart_time_mode)
-	if [ -n "$restart_week_mode" ]; then
-		local t="0 $restart_time_mode * * $restart_week_mode"
-		[ "$restart_week_mode" = "7" ] && t="0 $restart_time_mode * * *"
-		if [ "$restart_week_mode" = "8" ]; then
-			update_loop=1
-		else
-			echo "$t /etc/init.d/$CONFIG restart > /dev/null 2>&1 &" >>/etc/crontabs/root
-		fi
-		echolog "配置定时任务：自动重启服务。"
-	fi
-
-	autoupdate=$(config_t_get global_rules auto_update)
-	weekupdate=$(config_t_get global_rules week_update)
-	dayupdate=$(config_t_get global_rules time_update)
-	if [ "$autoupdate" = "1" ]; then
-		local t="0 $dayupdate * * $weekupdate"
-		[ "$weekupdate" = "7" ] && t="0 $dayupdate * * *"
-		if [ "$weekupdate" = "8" ]; then
-			update_loop=1
-		else
-			echo "$t lua $APP_PATH/rule_update.lua log all cron > /dev/null 2>&1 &" >>/etc/crontabs/root
-		fi
-		echolog "配置定时任务：自动更新规则。"
-	fi
-
-	TMP_SUB_PATH=$TMP_PATH/sub_crontabs
-	mkdir -p $TMP_SUB_PATH
-	for item in $(uci show ${CONFIG} | grep "=subscribe_list" | cut -d '.' -sf 2 | cut -d '=' -sf 1); do
-		if [ "$(config_n_get $item auto_update 0)" = "1" ]; then
-			cfgid=$(uci show ${CONFIG}.$item | head -n 1 | cut -d '.' -sf 2 | cut -d '=' -sf 1)
-			remark=$(config_n_get $item remark)
-			week_update=$(config_n_get $item week_update)
-			time_update=$(config_n_get $item time_update)
-			echo "$cfgid" >> $TMP_SUB_PATH/${week_update}_${time_update}
-			echolog "配置定时任务：自动更新【$remark】订阅。"
-		fi
-	done
-
-	[ -d "${TMP_SUB_PATH}" ] && {
-		for name in $(ls ${TMP_SUB_PATH}); do
-			week_update=$(echo $name | awk -F '_' '{print $1}')
-			time_update=$(echo $name | awk -F '_' '{print $2}')
-			cfgids=$(echo -n $(cat ${TMP_SUB_PATH}/${name}) | sed 's# #,#g')
-			local t="0 $time_update * * $week_update"
-			[ "$week_update" = "7" ] && t="0 $time_update * * *"
-			if [ "$week_update" = "8" ]; then
-				update_loop=1
-			else
-				echo "$t lua $APP_PATH/subscribe.lua start $cfgids cron > /dev/null 2>&1 &" >>/etc/crontabs/root
-			fi
-		done
-		rm -rf $TMP_SUB_PATH
-	}
-
-	if [ "$ENABLED_DEFAULT_ACL" == 1 ] || [ "$ENABLED_ACLS" == 1 ]; then
-		[ "$update_loop" = "1" ] && {
-			$APP_PATH/tasks.sh > /dev/null 2>&1 &
-			echolog "自动更新：启动循环更新进程。"
-		}
-	else
-		echolog "运行于非代理模式，仅允许服务启停的定时任务。"
-	fi
-
-	/etc/init.d/cron restart
-}
-
-stop_crontab() {
-	[ -f "/tmp/lock/${CONFIG}_cron.lock" ] && return
-	clean_crontab
-	/etc/init.d/cron restart
-	#echolog "清除定时执行命令。"
-}
-
-start_dns() {
-	echolog "DNS域名解析："
-
-	local china_ng_local_dns=$(IFS=','; set -- $LOCAL_DNS; [ "${1%%[#:]*}" = "127.0.0.1" ] && echo "$1" || ([ -n "$2" ] && echo "$*" || echo "$1"))
-	local sing_box_local_dns=
-	local direct_dns_mode=$(config_t_get global direct_dns_mode "auto")
-
-	#获取访问控制节点所使用的DNS分流模式
-	local ACL_RULE_DNSMASQ=0
-	for acl_section in $(uci show ${CONFIG} | grep "=acl_rule" | cut -d '.' -sf 2 | cut -d '=' -sf 1); do
-		if [ "$(config_n_get $acl_section enabled)" = "1" ] && \
-		   [ "$(config_n_get $acl_section dns_shunt)" = "dnsmasq" ]; then
-			ACL_RULE_DNSMASQ=1
-			break
-		fi
-	done
-
-	case "$direct_dns_mode" in
-		udp)
-			LOCAL_DNS=$(config_t_get global direct_dns 223.5.5.5 | sed -E 's/^\[([^]]+)\]:(.*)$/\1#\2/; t; s/^([^:]+):([0-9]+)$/\1#\2/')
-			china_ng_local_dns=${LOCAL_DNS}
-			sing_box_local_dns="direct_dns_udp_server=${LOCAL_DNS}"
-		;;
-		tcp)	
-			local DIRECT_DNS=$(config_t_get global direct_dns 223.5.5.5 | sed -E 's/^\[([^]]+)\]:(.*)$/\1#\2/; t; s/^([^:]+):([0-9]+)$/\1#\2/')
-			china_ng_local_dns="tcp://${DIRECT_DNS}"
-			sing_box_local_dns="direct_dns_tcp_server=${DIRECT_DNS}"
-
-			#当全局（包括访问控制节点）开启chinadns-ng时，不启动新进程。
-			[ "$DNS_SHUNT" != "chinadns-ng" ] || [ "$ACL_RULE_DNSMASQ" = "1" ] && {
-				LOCAL_DNS="127.0.0.1#${NEXT_DNS_LISTEN_PORT}"
-				local china_ng_c_dns="tcp://$(get_first_dns DIRECT_DNS 53 | sed -E 's/^\[([^]]+)\]:(.*)$/\1#\2/; t; s/^([^:]+):([0-9]+)$/\1#\2/')"
-				ln_run "$(first_type chinadns-ng)" chinadns-ng "/dev/null" -b :: -l ${NEXT_DNS_LISTEN_PORT} -c ${china_ng_c_dns} -d chn
-				echolog "  - ChinaDNS-NG(${LOCAL_DNS}) -> ${china_ng_c_dns}"
-				echolog "  * 请确保上游直连 DNS 支持 TCP 查询。"
-				NEXT_DNS_LISTEN_PORT=$(expr $NEXT_DNS_LISTEN_PORT + 1)
-			}
-		;;
-		auto)
-			#Automatic logic is already done by default
-			:
-		;;
-	esac
-
-	# 追加直连DNS到iptables/nftables
-	[ "$(config_t_get global_haproxy balancing_enable 0)" != "1" ] && IPT_APPEND_DNS=
-	add_default_port() {
-		[ -z "$1" ] && echo "" || echo "$1" | awk -F',' '{for(i=1;i<=NF;i++){if($i !~ /#/) $i=$i"#53";} print $0;}' OFS=','
-	}
-	LOCAL_DNS=$(add_default_port "$LOCAL_DNS")
-	IPT_APPEND_DNS=$(add_default_port "${IPT_APPEND_DNS:-$LOCAL_DNS}")
-	echo "$IPT_APPEND_DNS" | grep -q -E "(^|,)$LOCAL_DNS(,|$)" || IPT_APPEND_DNS="${IPT_APPEND_DNS:+$IPT_APPEND_DNS,}$LOCAL_DNS"
-	[ -n "$DIRECT_DNS" ] && {
-		DIRECT_DNS=$(add_default_port "$DIRECT_DNS")
-		echo "$IPT_APPEND_DNS" | grep -q -E "(^|,)$DIRECT_DNS(,|$)" || IPT_APPEND_DNS="${IPT_APPEND_DNS:+$IPT_APPEND_DNS,}$DIRECT_DNS"
-	}
-	# 排除127.0.0.1的条目
-	IPT_APPEND_DNS=$(echo "$IPT_APPEND_DNS" | awk -F',' '{for(i=1;i<=NF;i++) if($i !~ /^127\.0\.0\.1/) printf (i>1?",":"") $i; print ""}' | sed 's/^,\|,$//g')
-
-	TUN_DNS="127.0.0.1#${NEXT_DNS_LISTEN_PORT}"
-	[ -n "${NO_PLUGIN_DNS}" ] && TUN_DNS="127.0.0.1#${resolve_dns_port}"
-
-	case "$DNS_MODE" in
-	dns2socks)
-		local dns2socks_socks_server=$(echo $(config_t_get global socks_server 127.0.0.1:1080) | sed "s/#/:/g")
-		local dns2socks_forward=$(get_first_dns REMOTE_DNS 53 | sed 's/#/:/g')
-		run_dns2socks socks=$dns2socks_socks_server listen_address=127.0.0.1 listen_port=${NEXT_DNS_LISTEN_PORT} dns=$dns2socks_forward cache=$DNS_CACHE
-		echolog "  - dns2socks(${TUN_DNS})，${dns2socks_socks_server} -> tcp://${dns2socks_forward}"
-	;;
-	sing-box)
-		[ -z "${NO_PLUGIN_DNS}" ] && {
-			local config_file=$TMP_PATH/DNS.json
-			local log_file=$TMP_PATH/DNS.log
-			local log_file=/dev/null
-			local _args="type=$DNS_MODE config_file=$config_file log_file=$log_file"
-			[ "${DNS_CACHE}" == "0" ] && _args="${_args} dns_cache=0"
-			_args="${_args} direct_dns_query_strategy=${DIRECT_DNS_QUERY_STRATEGY}"
-			_args="${_args} remote_dns_query_strategy=${REMOTE_DNS_QUERY_STRATEGY}"
-			DNSMASQ_FILTER_PROXY_IPV6=0
-			local _remote_dns_client_ip=$(config_t_get global remote_dns_client_ip)
-			[ -n "${_remote_dns_client_ip}" ] && _args="${_args} remote_dns_client_ip=${_remote_dns_client_ip}"
-			TCP_PROXY_DNS=1
-			local v2ray_dns_mode=$(config_t_get global v2ray_dns_mode tcp)
-			_args="${_args} dns_listen_port=${NEXT_DNS_LISTEN_PORT}"
-			_args="${_args} remote_dns_protocol=${v2ray_dns_mode}"
-			case "$v2ray_dns_mode" in
-				udp|tcp)
-					local _proto="$v2ray_dns_mode"
-					_args="${_args} remote_dns_${_proto}_server=${REMOTE_DNS}"
-					echolog "  - Sing-Box DNS(${TUN_DNS}) -> ${_proto}://${REMOTE_DNS}"
-				;;
-				doh)
-					remote_dns_doh=$(config_t_get global remote_dns_doh "https://1.1.1.1/dns-query")
-					_args="${_args} remote_dns_doh=${remote_dns_doh}"
-					echolog "  - Sing-Box DNS(${TUN_DNS}) -> ${remote_dns_doh}"
-
-					local _doh_url _doh_host _doh_port _doh_bootstrap
-					parse_doh "$remote_dns_doh" _doh_url _doh_host _doh_port _doh_bootstrap
-					[ -n "${_doh_bootstrap}" ] && REMOTE_DNS="${_doh_bootstrap}#${_doh_port}"
-				;;
-			esac
-			_args="${_args} dns_socks_address=127.0.0.1 dns_socks_port=${tcp_node_socks_port}"
-			[ -n "${sing_box_local_dns}" ] && _args="${_args} ${sing_box_local_dns}"
-			run_singbox ${_args}
-		}
-	;;
-	xray)
-		[ -z "${NO_PLUGIN_DNS}" ] && {
-			local config_file=$TMP_PATH/DNS.json
-			local log_file=$TMP_PATH/DNS.log
-			local log_file=/dev/null
-			local _args="type=$DNS_MODE config_file=$config_file log_file=$log_file"
-			[ "${DNS_CACHE}" == "0" ] && _args="${_args} dns_cache=0"
-			_args="${_args} direct_dns_query_strategy=${DIRECT_DNS_QUERY_STRATEGY}"
-			_args="${_args} remote_dns_query_strategy=${REMOTE_DNS_QUERY_STRATEGY}"
-			DNSMASQ_FILTER_PROXY_IPV6=0
-			local _remote_dns_client_ip=$(config_t_get global remote_dns_client_ip)
-			[ -n "${_remote_dns_client_ip}" ] && _args="${_args} remote_dns_client_ip=${_remote_dns_client_ip}"
-			TCP_PROXY_DNS=1
-			_args="${_args} dns_listen_port=${NEXT_DNS_LISTEN_PORT}"
-			_args="${_args} remote_dns_protocol=${v2ray_dns_mode}"
-			case "$v2ray_dns_mode" in
-				udp)
-					_args="${_args} remote_dns_udp_server=${REMOTE_DNS}"
-					echolog "  - Xray DNS(${TUN_DNS}) -> udp://${REMOTE_DNS}"
-				;;
-				tcp|tcp+doh)
-					_args="${_args} remote_dns_tcp_server=${REMOTE_DNS}"
-					local v2ray_dns_mode=$(config_t_get global v2ray_dns_mode tcp)
-					if [ "$v2ray_dns_mode" = "tcp+doh" ]; then
-						remote_dns_doh=$(config_t_get global remote_dns_doh "https://1.1.1.1/dns-query")
-						_args="${_args} remote_dns_doh=${remote_dns_doh}"
-						echolog "  - Xray DNS(${TUN_DNS}) -> (${remote_dns_doh})(A/AAAA) + tcp://${REMOTE_DNS}"
-
-						local _doh_url _doh_host _doh_port _doh_bootstrap
-						parse_doh "$remote_dns_doh" _doh_url _doh_host _doh_port _doh_bootstrap
-						[ -n "${_doh_bootstrap}" ] && REMOTE_DNS="${REMOTE_DNS},${_doh_bootstrap}#${_doh_port}"
-					else
-						echolog "  - Xray DNS(${TUN_DNS}) -> tcp://${REMOTE_DNS}"
-					fi
-				;;
-			esac
-			_args="${_args} dns_socks_address=127.0.0.1 dns_socks_port=${tcp_node_socks_port}"
-			run_xray ${_args}
-		}
-	;;
-	udp)
-		UDP_PROXY_DNS=1
-		local china_ng_listen_port=${NEXT_DNS_LISTEN_PORT}
-		local china_ng_trust_dns="udp://$(get_first_dns REMOTE_DNS 53 | sed -E 's/^\[([^]]+)\]:(.*)$/\1#\2/; t; s/^([^:]+):([0-9]+)$/\1#\2/')"
-		if [ "$DNS_SHUNT" != "chinadns-ng" ] && [ "$FILTER_PROXY_IPV6" = "1" ]; then
-			DNSMASQ_FILTER_PROXY_IPV6=0
-			local no_ipv6_trust="-N"
-			ln_run "$(first_type chinadns-ng)" chinadns-ng "/dev/null" -b :: -l ${china_ng_listen_port} -t ${china_ng_trust_dns} -d gfw ${no_ipv6_trust}
-			echolog "  - ChinaDNS-NG(${TUN_DNS}) -> ${china_ng_trust_dns}"
-		else
-			TUN_DNS="$(echo ${REMOTE_DNS} | sed 's/#/:/g' | sed -E 's/\:([^:]+)$/#\1/g')"
-			echolog "  - udp://${TUN_DNS}"
-		fi
-	;;
-	tcp)
-		TCP_PROXY_DNS=1
-		local china_ng_listen_port=${NEXT_DNS_LISTEN_PORT}
-		local china_ng_trust_dns="tcp://$(get_first_dns REMOTE_DNS 53 | sed -E 's/^\[([^]]+)\]:(.*)$/\1#\2/; t; s/^([^:]+):([0-9]+)$/\1#\2/')"
-		[ "$DNS_SHUNT" != "chinadns-ng" ] && {
-			[ "$FILTER_PROXY_IPV6" = "1" ] && DNSMASQ_FILTER_PROXY_IPV6=0 && local no_ipv6_trust="-N"
-			ln_run "$(first_type chinadns-ng)" chinadns-ng "/dev/null" -b :: -l ${china_ng_listen_port} -t ${china_ng_trust_dns} -d gfw ${no_ipv6_trust}
-			echolog "  - ChinaDNS-NG(${TUN_DNS}) -> ${china_ng_trust_dns}"
-		}
-	;;
-	esac
-
-	[ -n "${resolve_dns_log}" ] && echolog "  - ${resolve_dns_log}"
-
-	[ -n "${TCP_PROXY_DNS}" ] && echolog "  * 请确认上游 DNS 支持 TCP/DoH 查询，如非直连地址，确保 TCP 代理打开，并且已经正确转发！"
-	[ -n "${UDP_PROXY_DNS}" ] && echolog "  * 请确认上游 DNS 支持 UDP 查询并已使用 UDP 节点，如上游 DNS 非直连地址，确保 UDP 代理打开，并且已经正确转发！"
-
-	[ "${DNS_SHUNT}" = "smartdns" ] && {
-		if command -v smartdns > /dev/null 2>&1; then
-			rm -rf $TMP_PATH2/dnsmasq_default*
-			local group_domestic=$(config_t_get global group_domestic)
-			local smartdns_remote_dns=$(config_t_get global smartdns_remote_dns)
-			if [ -n "${smartdns_remote_dns}" -a "${smartdns_remote_dns}" != "nil" ]; then
-				smartdns_remote_dns=$(echo ${smartdns_remote_dns} | tr -s ' ' '|')
-			else
-				smartdns_remote_dns="tcp://1.1.1.1"
-			fi
-			local subnet_ip=$(config_t_get global remote_dns_client_ip)
-			lua $APP_PATH/helper_smartdns_add.lua -FLAG "default" -SMARTDNS_CONF "/tmp/etc/smartdns/$CONFIG.conf" \
-				-LOCAL_GROUP ${group_domestic:-nil} -REMOTE_GROUP "passwall_proxy" -REMOTE_PROXY_SERVER ${TCP_SOCKS_server} -USE_DEFAULT_DNS "${USE_DEFAULT_DNS:-direct}" \
-				-REMOTE_DNS ${smartdns_remote_dns} -DNS_MODE ${DNS_MODE:-socks} -TUN_DNS ${TUN_DNS} -REMOTE_FAKEDNS ${fakedns:-0} \
-				-USE_DIRECT_LIST "${USE_DIRECT_LIST}" -USE_PROXY_LIST "${USE_PROXY_LIST}" -USE_BLOCK_LIST "${USE_BLOCK_LIST}" -USE_GFW_LIST "${USE_GFW_LIST}" -CHN_LIST "${CHN_LIST}" \
-				-TCP_NODE ${TCP_NODE} -DEFAULT_PROXY_MODE "${TCP_PROXY_MODE}" -NO_PROXY_IPV6 ${FILTER_PROXY_IPV6:-0} -NFTFLAG ${nftflag:-0} \
-				-SUBNET ${subnet_ip:-0} -NO_LOGIC_LOG ${NO_LOGIC_LOG:-0}
-			source $APP_PATH/helper_smartdns.sh restart
-			echolog "  - 域名解析：使用SmartDNS，请确保配置正常。"
-			return
-		else
-			DNS_SHUNT="dnsmasq"
-			echolog "  * 未安装SmartDNS，默认使用Dnsmasq进行域名解析！"
-		fi
-	}
-
-	[ "$DNS_SHUNT" = "chinadns-ng" ] && [ -n "$(first_type chinadns-ng)" ] && {
-		chinadns_ng_min=2024.04.13
-		chinadns_ng_now=$($(first_type chinadns-ng) -V | grep -i "ChinaDNS-NG " | awk '{print $2}')
-		if [ $(check_ver "$chinadns_ng_now" "$chinadns_ng_min") = 1 ]; then
-			echolog "  * 注意：当前 ChinaDNS-NG 版本为[ $chinadns_ng_now ]，请更新到[ $chinadns_ng_min ]或以上版本，否则 DNS 有可能无法正常工作！"
-		fi
-
-		[ "$FILTER_PROXY_IPV6" = "1" ] && DNSMASQ_FILTER_PROXY_IPV6=0
-		[ -z "${china_ng_listen_port}" ] && local china_ng_listen_port=$(expr $NEXT_DNS_LISTEN_PORT + 1)
-		local china_ng_listen="127.0.0.1#${china_ng_listen_port}"
-		[ -z "${china_ng_trust_dns}" ] && local china_ng_trust_dns=${TUN_DNS}
-
-		echolog "  - ChinaDNS-NG(${china_ng_listen})：直连DNS：${china_ng_local_dns}，可信DNS：${china_ng_trust_dns}"
-
-		china_ng_listen="${china_ng_listen},::1#${china_ng_listen_port}"
-
-		run_chinadns_ng \
-			_flag="default" \
-			_listen_port=${china_ng_listen_port} \
-			_dns_local=${china_ng_local_dns} \
-			_dns_trust=${china_ng_trust_dns} \
-			_no_ipv6_trust=${FILTER_PROXY_IPV6} \
-			_use_direct_list=${USE_DIRECT_LIST} \
-			_use_proxy_list=${USE_PROXY_LIST} \
-			_use_block_list=${USE_BLOCK_LIST} \
-			_gfwlist=${USE_GFW_LIST} \
-			_chnlist=${CHN_LIST} \
-			_default_mode=${TCP_PROXY_MODE} \
-			_default_tag=$(config_t_get global chinadns_ng_default_tag smart) \
-			_no_logic_log=0 \
-			_tcp_node=${TCP_NODE} \
-			_remote_fakedns=${fakedns:-0}
-
-		USE_DEFAULT_DNS="chinadns_ng"
-	}
-
-	[ "$USE_DEFAULT_DNS" = "remote" ] && {
-		dnsmasq_version=$(dnsmasq -v | grep -i "Dnsmasq version " | awk '{print $3}')
-		[ "$(expr $dnsmasq_version \>= 2.87)" == 0 ] && echolog "Dnsmasq版本低于2.87，有可能无法正常使用！！！"
-	}
-
-	local DNSMASQ_TUN_DNS=$(get_first_dns TUN_DNS 53 | sed -E 's/^\[([^]]+)\]:(.*)$/\1#\2/; t; s/^([^:]+):([0-9]+)$/\1#\2/')
-	local RUN_NEW_DNSMASQ=1
-	RUN_NEW_DNSMASQ=${DNS_REDIRECT}
-	if [ "${RUN_NEW_DNSMASQ}" == "0" ]; then
-		#The old logic will be removed in the future.
-		#Run a copy dnsmasq instance, DNS hijack that don't need a proxy devices.
-		[ "1" = "0" ] && {
-			DIRECT_DNSMASQ_PORT=$(get_new_port 11400)
-			DIRECT_DNSMASQ_CONF=${GLOBAL_ACL_PATH}/direct_dnsmasq.conf
-			DIRECT_DNSMASQ_CONF_PATH=${GLOBAL_ACL_PATH}/direct_dnsmasq.d
-			mkdir -p ${DIRECT_DNSMASQ_CONF_PATH}
-			lua $APP_PATH/helper_dnsmasq.lua copy_instance -LISTEN_PORT ${DIRECT_DNSMASQ_PORT} -DNSMASQ_CONF ${DIRECT_DNSMASQ_CONF} -TMP_DNSMASQ_PATH ${DIRECT_DNSMASQ_CONF_PATH}
-			ln_run "$(first_type dnsmasq)" "dnsmasq_direct" "/dev/null" -C ${DIRECT_DNSMASQ_CONF} -x ${GLOBAL_ACL_PATH}/direct_dnsmasq.pid
-			echo "${DIRECT_DNSMASQ_PORT}" > ${GLOBAL_ACL_PATH}/direct_dnsmasq_port
-		}
-		
-		#Rewrite the default DNS service configuration
-		#Modify the default dnsmasq service
-		lua $APP_PATH/helper_dnsmasq.lua stretch
-		lua $APP_PATH/helper_dnsmasq.lua add_rule -FLAG "default" -TMP_DNSMASQ_PATH ${GLOBAL_DNSMASQ_CONF_PATH} -DNSMASQ_CONF_FILE ${GLOBAL_DNSMASQ_CONF} \
-			-DEFAULT_DNS ${DEFAULT_DNS} -LOCAL_DNS ${LOCAL_DNS} -TUN_DNS ${DNSMASQ_TUN_DNS} \
-			-REMOTE_FAKEDNS ${fakedns:-0} -USE_DEFAULT_DNS "${USE_DEFAULT_DNS:-direct}" -CHINADNS_DNS ${china_ng_listen:-0} \
-			-USE_DIRECT_LIST "${USE_DIRECT_LIST}" -USE_PROXY_LIST "${USE_PROXY_LIST}" -USE_BLOCK_LIST "${USE_BLOCK_LIST}" -USE_GFW_LIST "${USE_GFW_LIST}" -CHN_LIST "${CHN_LIST}" \
-			-TCP_NODE ${TCP_NODE} -DEFAULT_PROXY_MODE ${TCP_PROXY_MODE} -NO_PROXY_IPV6 ${DNSMASQ_FILTER_PROXY_IPV6:-0} -NFTFLAG ${nftflag:-0} \
-			-NO_LOGIC_LOG ${NO_LOGIC_LOG:-0}
-		uci -q add_list dhcp.@dnsmasq[0].addnmount=${GLOBAL_DNSMASQ_CONF_PATH}
-		uci -q commit dhcp
-		lua $APP_PATH/helper_dnsmasq.lua logic_restart -LOG 1
-	else
-		#Run a copy dnsmasq instance, DNS hijack for that need proxy devices.
-		GLOBAL_DNSMASQ_PORT=$(get_new_port 11400)
-		GLOBAL_DNSMASQ_CONF=${GLOBAL_ACL_PATH}/dnsmasq.conf
-		GLOBAL_DNSMASQ_CONF_PATH=${GLOBAL_ACL_PATH}/dnsmasq.d
-		lua $APP_PATH/helper_dnsmasq.lua add_rule -FLAG "default" -TMP_DNSMASQ_PATH ${GLOBAL_DNSMASQ_CONF_PATH} -DNSMASQ_CONF_FILE ${GLOBAL_DNSMASQ_CONF} \
-			-LISTEN_PORT ${GLOBAL_DNSMASQ_PORT} -DEFAULT_DNS ${DEFAULT_DNS} -LOCAL_DNS ${LOCAL_DNS} -TUN_DNS ${DNSMASQ_TUN_DNS} \
-			-REMOTE_FAKEDNS ${fakedns:-0} -USE_DEFAULT_DNS "${USE_DEFAULT_DNS:-direct}" -CHINADNS_DNS ${china_ng_listen:-0} \
-			-USE_DIRECT_LIST "${USE_DIRECT_LIST}" -USE_PROXY_LIST "${USE_PROXY_LIST}" -USE_BLOCK_LIST "${USE_BLOCK_LIST}" -USE_GFW_LIST "${USE_GFW_LIST}" -CHN_LIST "${CHN_LIST}" \
-			-TCP_NODE ${TCP_NODE} -DEFAULT_PROXY_MODE ${TCP_PROXY_MODE} -NO_PROXY_IPV6 ${DNSMASQ_FILTER_PROXY_IPV6:-0} -NFTFLAG ${nftflag:-0} \
-			-NO_LOGIC_LOG ${NO_LOGIC_LOG:-0}
-		ln_run "$(first_type dnsmasq)" "dnsmasq_default" "/dev/null" -C ${GLOBAL_DNSMASQ_CONF} -x ${GLOBAL_ACL_PATH}/dnsmasq.pid
-		set_cache_var "ACL_default_dns_port" "${GLOBAL_DNSMASQ_PORT}"
-		DNS_REDIRECT_PORT=${GLOBAL_DNSMASQ_PORT}
-		#dhcp.leases to hosts
-		$APP_PATH/lease2hosts.sh > /dev/null 2>&1 &
-	fi
-}
-
-add_ip2route() {
-	local ip=$(get_host_ip "ipv4" $1)
-	[ -z "$ip" ] && {
-		echolog "  - 无法解析[${1}]，路由表添加失败！"
-		return 1
-	}
-	local remarks="${1}"
-	[ "$remarks" != "$ip" ] && remarks="${1}(${ip})"
-
-	. /lib/functions/network.sh
-	local gateway device
-	network_get_gateway gateway "$2"
-	network_get_device device "$2"
-	[ -z "${device}" ] && device="$2"
-
-	if [ -n "${gateway}" ]; then
-		route add -host ${ip} gw ${gateway} dev ${device} >/dev/null 2>&1
-		echo "$ip" >> $TMP_ROUTE_PATH/${device}
-		echolog "  - [${remarks}]添加到接口[${device}]路由表成功！"
-	else
-		echolog "  - [${remarks}]添加到接口[${device}]路由表失功！原因是找不到[${device}]网关。"
-	fi
-}
-
-delete_ip2route() {
-	[ -d "${TMP_ROUTE_PATH}" ] && {
-		local interface
-		for interface in $(ls ${TMP_ROUTE_PATH}); do
-			for ip in $(cat ${TMP_ROUTE_PATH}/${interface}); do
-				route del -host ${ip} dev ${interface} >/dev/null 2>&1
-			done
-		done
-	}
-}
-
-start_haproxy() {
-	[ "$(config_t_get global_haproxy balancing_enable 0)" != "1" ] && return
-	haproxy_path=$TMP_PATH/haproxy
-	haproxy_conf="config.cfg"
-	lua $APP_PATH/haproxy.lua -path ${haproxy_path} -conf ${haproxy_conf} -dns ${LOCAL_DNS}
-	ln_run "$(first_type haproxy)" haproxy "/dev/null" -f "${haproxy_path}/${haproxy_conf}"
-}
-
-kill_all() {
-	kill -9 $(pidof "$@") >/dev/null 2>&1
-}
-
-acl_app() {
-	local items=$(uci show ${CONFIG} | grep "=acl_rule" | cut -d '.' -sf 2 | cut -d '=' -sf 1)
-	[ -n "$items" ] && {
-		local item
-		local socks_port redir_port dns_port dnsmasq_port chinadns_port
-		local msg msg2
-		socks_port=11100
-		redir_port=11200
-		dns_port=11300
-		dnsmasq_port=${GLOBAL_DNSMASQ_PORT:-11400}
-		chinadns_port=11500
-		for item in $items; do
-			local sid=$(uci -q show "${CONFIG}.${item}" | grep "=acl_rule" | awk -F '=' '{print $1}' | awk -F '.' '{print $2}')
-			[ "$(config_n_get $sid enabled)" = "1" ] || continue
-			eval $(uci -q show "${CONFIG}.${item}" | cut -d'.' -sf 3-)
-
-			if [ -n "${sources}" ]; then
-				for s in $sources; do
-					local s2
-					is_iprange=$(lua_api "iprange(\"${s}\")")
-					if [ "${is_iprange}" = "true" ]; then
-						s2="iprange:${s}"
-					elif [ -n "$(echo ${s} | grep '^ipset:')" ]; then
-						s2="ipset:${s}"
-					else
-						_ip_or_mac=$(lua_api "ip_or_mac(\"${s}\")")
-						if [ "${_ip_or_mac}" = "ip" ]; then
-							s2="ip:${s}"
-						elif [ "${_ip_or_mac}" = "mac" ]; then
-							s2="mac:${s}"
-						fi
-					fi
-					[ -n "${s2}" ] && source_list="${source_list}\n${s2}"
-					unset s2
-				done
-			else
-				source_list="any"
-			fi
-
-			local acl_path=${TMP_ACL_PATH}/$sid
-			mkdir -p ${acl_path}
-			[ -n "${source_list}" ] && echo -e "${source_list}" | sed '/^$/d' > ${acl_path}/source_list
-
-			use_global_config=${use_global_config:-0}
-			[ "${use_global_config}" = "1" ] && {
-				tcp_node="default"
-				udp_node="default"
-			}
-			tcp_no_redir_ports=${tcp_no_redir_ports:-${TCP_NO_REDIR_PORTS}}
-			udp_no_redir_ports=${udp_no_redir_ports:-${UDP_NO_REDIR_PORTS}}
-			if has_1_65535 "$tcp_no_redir_ports" && has_1_65535 "$udp_no_redir_ports"; then
-				unset use_global_config
-				unset tcp_node
-				unset udp_node
-			else
-				use_direct_list=${use_direct_list:-1}
-				use_proxy_list=${use_proxy_list:-1}
-				use_block_list=${use_block_list:-1}
-				use_gfw_list=${use_gfw_list:-1}
-				chn_list=${chn_list:-direct}
-				tcp_proxy_mode=${tcp_proxy_mode:-proxy}
-				udp_proxy_mode=${udp_proxy_mode:-proxy}
-				filter_proxy_ipv6=${filter_proxy_ipv6:-0}
-				dnsmasq_filter_proxy_ipv6=${filter_proxy_ipv6}
-				dns_shunt=${dns_shunt:-dnsmasq}
-				dns_mode=${dns_mode:-dns2socks}
-				remote_dns=${remote_dns:-1.1.1.1}
-				use_default_dns=${use_default_dns:-direct}
-				[ "$dns_mode" = "sing-box" ] && {
-					[ "$v2ray_dns_mode" = "doh" ] && remote_dns=${remote_dns_doh:-https://1.1.1.1/dns-query}
-				}
-			fi
-
-			[ -n "$tcp_node" ] && {
-				local GLOBAL_TCP_NODE=$(get_cache_var "ACL_GLOBAL_TCP_node")
-				[ -n "${GLOBAL_TCP_NODE}" ] && GLOBAL_TCP_redir_port=$(get_cache_var "ACL_GLOBAL_TCP_redir_port")
-				if [ "$tcp_node" = "default" ]; then
-					if [ -n "${GLOBAL_TCP_NODE}" ]; then
-						set_cache_var "ACL_${sid}_tcp_node" "${GLOBAL_TCP_NODE}"
-						set_cache_var "ACL_${sid}_tcp_redir_port" "${GLOBAL_TCP_redir_port}"
-						set_cache_var "ACL_${sid}_dns_port" "${GLOBAL_DNSMASQ_PORT}"
-						set_cache_var "ACL_${sid}_tcp_default" "1"
-					else
-						echolog "  - 全局节点未启用，跳过【${remarks}】"
-					fi
-				else
-					[ "$(config_get_type $tcp_node)" = "nodes" ] && {
-						if [ -n "${GLOBAL_TCP_NODE}" ] && [ "$tcp_node" = "${GLOBAL_TCP_NODE}" ]; then
-							set_cache_var "ACL_${sid}_tcp_node" "${GLOBAL_TCP_NODE}"
-							set_cache_var "ACL_${sid}_tcp_redir_port" "${GLOBAL_TCP_redir_port}"
-							set_cache_var "ACL_${sid}_dns_port" "${GLOBAL_DNSMASQ_PORT}"
-							set_cache_var "ACL_${sid}_tcp_default" "1"
-						else
-							run_dns() {
-								local _dns_port
-								[ -n $1 ] && _dns_port=$1
-								[ -z ${_dns_port} ] && {
-									dns_port=$(get_new_port $(expr $dns_port + 1))
-									_dns_port=$dns_port
-									if [ "$dns_mode" = "dns2socks" ]; then
-										run_dns2socks flag=acl_${sid} socks_address=127.0.0.1 socks_port=$socks_port listen_address=0.0.0.0 listen_port=${_dns_port} dns=$remote_dns cache=1
-									elif [ "$dns_mode" = "sing-box" -o "$dns_mode" = "xray" ]; then
-										config_file=$TMP_ACL_PATH/${tcp_node}_SOCKS_${socks_port}_DNS.json
-										[ "$dns_mode" = "xray" ] && [ "$v2ray_dns_mode" = "tcp+doh" ] && remote_dns_doh=${remote_dns_doh:-https://1.1.1.1/dns-query}
-										local type=${dns_mode}
-										[ "${dns_mode}" = "sing-box" ] && type="singbox"
-										dnsmasq_filter_proxy_ipv6=0
-										remote_dns_query_strategy="UseIP"
-										[ "$filter_proxy_ipv6" = "1" ] && remote_dns_query_strategy="UseIPv4"
-										run_${type} flag=acl_${sid} type=$dns_mode dns_socks_address=127.0.0.1 dns_socks_port=$socks_port dns_listen_port=${_dns_port} remote_dns_protocol=${v2ray_dns_mode} remote_dns_udp_server=${remote_dns} remote_dns_tcp_server=${remote_dns} remote_dns_doh="${remote_dns_doh}" remote_dns_query_strategy=${remote_dns_query_strategy} remote_dns_client_ip=${remote_dns_client_ip} config_file=$config_file
-									fi
-									set_cache_var "node_${tcp_node}_$(echo -n "${remote_dns}" | md5sum | cut -d " " -f1)" "${_dns_port}"
-								}
-
-								[ "$dns_shunt" = "chinadns-ng" ] && [ -n "$(first_type chinadns-ng)" ] && {
-									chinadns_ng_min=2024.04.13
-									chinadns_ng_now=$($(first_type chinadns-ng) -V | grep -i "ChinaDNS-NG " | awk '{print $2}')
-									if [ $(check_ver "$chinadns_ng_now" "$chinadns_ng_min") = 1 ]; then
-										echolog "  * 注意：当前 ChinaDNS-NG 版本为[ $chinadns_ng_now ]，请更新到[ $chinadns_ng_min ]或以上版本，否则 DNS 有可能无法正常工作！"
-									fi
-
-									[ "$filter_proxy_ipv6" = "1" ] && dnsmasq_filter_proxy_ipv6=0
-									chinadns_port=$(expr $chinadns_port + 1)
-									_china_ng_listen="127.0.0.1#${chinadns_port},::1#${chinadns_port}"
-
-									_chinadns_local_dns=$(IFS=','; set -- $LOCAL_DNS; [ "${1%%[#:]*}" = "127.0.0.1" ] && echo "$1" || ([ -n "$2" ] && echo "$1,$2" || echo "$1"))
-									_direct_dns_mode=$(config_t_get global direct_dns_mode "auto")
-									case "${_direct_dns_mode}" in
-										udp)
-											_chinadns_local_dns=$(config_t_get global direct_dns 223.5.5.5 | sed -E 's/^\[([^]]+)\]:(.*)$/\1#\2/; t; s/^([^:]+):([0-9]+)$/\1#\2/')
-										;;
-										tcp)
-											_chinadns_local_dns="tcp://$(config_t_get global direct_dns 223.5.5.5 | sed -E 's/^\[([^]]+)\]:(.*)$/\1#\2/; t; s/^([^:]+):([0-9]+)$/\1#\2/')"
-										;;
-									esac
-
-									run_chinadns_ng \
-										_flag="$sid" \
-										_listen_port=${chinadns_port} \
-										_dns_local=${_chinadns_local_dns} \
-										_dns_trust=127.0.0.1#${_dns_port} \
-										_no_ipv6_trust=${filter_proxy_ipv6} \
-										_use_direct_list=${use_direct_list} \
-										_use_proxy_list=${use_proxy_list} \
-										_use_block_list=${use_block_list} \
-										_gfwlist=${use_gfw_list} \
-										_chnlist=${chn_list} \
-										_default_mode=${tcp_proxy_mode} \
-										_default_tag=${chinadns_ng_default_tag:-smart} \
-										_no_logic_log=1 \
-										_tcp_node=${tcp_node} \
-										_remote_fakedns=0
-
-									use_default_dns="chinadns_ng"
-								}
-
-								dnsmasq_port=$(get_new_port $(expr $dnsmasq_port + 1))
-								local dnsmasq_conf=${acl_path}/dnsmasq.conf
-								local dnsmasq_conf_path=${acl_path}/dnsmasq.d
-								lua $APP_PATH/helper_dnsmasq.lua add_rule -FLAG ${sid} -TMP_DNSMASQ_PATH ${dnsmasq_conf_path} -DNSMASQ_CONF_FILE ${dnsmasq_conf} \
-									-LISTEN_PORT ${dnsmasq_port} -DEFAULT_DNS ${DEFAULT_DNS} -LOCAL_DNS $LOCAL_DNS \
-									-USE_DIRECT_LIST "${use_direct_list}" -USE_PROXY_LIST "${use_proxy_list}" -USE_BLOCK_LIST "${use_block_list}" -USE_GFW_LIST "${use_gfw_list}" -CHN_LIST "${chn_list}" \
-									-TUN_DNS "127.0.0.1#${_dns_port}" -REMOTE_FAKEDNS 0 -USE_DEFAULT_DNS "${use_default_dns:-direct}" -CHINADNS_DNS ${_china_ng_listen:-0} \
-									-TCP_NODE $tcp_node -DEFAULT_PROXY_MODE ${tcp_proxy_mode} -NO_PROXY_IPV6 ${dnsmasq_filter_proxy_ipv6:-0} -NFTFLAG ${nftflag:-0} \
-									-NO_LOGIC_LOG 1
-								ln_run "$(first_type dnsmasq)" "dnsmasq_${sid}" "/dev/null" -C ${dnsmasq_conf} -x ${acl_path}/dnsmasq.pid
-								set_cache_var "ACL_${sid}_dns_port" "${dnsmasq_port}"
-								set_cache_var "node_${tcp_node}_$(echo -n "${tcp_proxy_mode}${remote_dns}" | md5sum | cut -d " " -f1)" "${dnsmasq_port}"
-								#dhcp.leases to hosts
-								$APP_PATH/lease2hosts.sh > /dev/null 2>&1 &
-							}
-							_redir_port=$(get_cache_var "node_${tcp_node}_redir_port")
-							_socks_port=$(get_cache_var "node_${tcp_node}_socks_port")
-							if [ -n "${_socks_port}" ] && [ -n "${_redir_port}" ]; then
-								socks_port=${_socks_port}
-								tcp_port=${_redir_port}
-								_dnsmasq_port=$(get_cache_var "node_${tcp_node}_$(echo -n "${tcp_proxy_mode}${remote_dns}" | md5sum | cut -d " " -f1)")
-								if [ -z "${_dnsmasq_port}" ]; then
-									_dns_port=$(get_cache_var "node_${tcp_node}_$(echo -n "${remote_dns}" | md5sum | cut -d " " -f1)")
-									run_dns ${_dns_port}
-								else
-									[ -n "${_dnsmasq_port}" ] && set_cache_var "ACL_${sid}_dns_port" "${_dnsmasq_port}"
-								fi
-							else
-								socks_port=$(get_new_port $(expr $socks_port + 1))
-								set_cache_var "node_${tcp_node}_socks_port" "${socks_port}"
-								redir_port=$(get_new_port $(expr $redir_port + 1))
-								set_cache_var "node_${tcp_node}_redir_port" "${redir_port}"
-								tcp_port=$redir_port
-
-								local type=$(echo $(config_n_get $tcp_node type) | tr 'A-Z' 'a-z')
-								if [ -n "${type}" ] && ([ "${type}" = "sing-box" ] || [ "${type}" = "xray" ]); then
-									config_file="acl/${tcp_node}_TCP_${redir_port}.json"
-									_extra_param="socks_address=127.0.0.1 socks_port=$socks_port"
-									_extra_param="${_extra_param} tcp_proxy_way=$TCP_PROXY_WAY"
-									if [ "$dns_mode" = "sing-box" ] || [ "$dns_mode" = "xray" ]; then
-										dns_port=$(get_new_port $(expr $dns_port + 1))
-										_dns_port=$dns_port
-										config_file="${config_file//TCP_/DNS_${_dns_port}_TCP_}"
-										remote_dns_doh=${remote_dns}
-										dnsmasq_filter_proxy_ipv6=0
-										remote_dns_query_strategy="UseIP"
-										[ "$filter_proxy_ipv6" = "1" ] && remote_dns_query_strategy="UseIPv4"
-										[ "$dns_mode" = "xray" ] && [ "$v2ray_dns_mode" = "tcp+doh" ] && remote_dns_doh=${remote_dns_doh:-https://1.1.1.1/dns-query}
-										_extra_param="dns_listen_port=${_dns_port} remote_dns_protocol=${v2ray_dns_mode} remote_dns_udp_server=${remote_dns} remote_dns_tcp_server=${remote_dns} remote_dns_doh=${remote_dns_doh} remote_dns_query_strategy=${remote_dns_query_strategy} remote_dns_client_ip=${remote_dns_client_ip}"
-									fi
-									[ -n "$udp_node" ] && ([ "$udp_node" = "tcp" ] || [ "$udp_node" = "$tcp_node" ]) && {
-										config_file="${config_file//TCP_/TCP_UDP_}"
-										_extra_param="${_extra_param} udp_redir_port=$redir_port"
-									}
-									config_file="$TMP_PATH/$config_file"
-									[ "${type}" = "sing-box" ] && type="singbox"
-									run_${type} flag=$tcp_node node=$tcp_node tcp_redir_port=$redir_port ${_extra_param} config_file=$config_file
-								else
-									config_file="acl/${tcp_node}_SOCKS_${socks_port}.json"
-									run_socks flag=$tcp_node node=$tcp_node bind=127.0.0.1 socks_port=$socks_port config_file=$config_file
-									local log_file=$TMP_ACL_PATH/ipt2socks_${tcp_node}_${redir_port}.log
-									log_file="/dev/null"
-									run_ipt2socks flag=acl_${tcp_node} tcp_tproxy=${is_tproxy} local_port=$redir_port socks_address=127.0.0.1 socks_port=$socks_port log_file=$log_file
-								fi
-								run_dns ${_dns_port}
-							fi
-							set_cache_var "ACL_${sid}_tcp_node" "${tcp_node}"
-							set_cache_var "ACL_${sid}_tcp_redir_port" "${tcp_port}"
-						fi
-					}
-				fi
-			}
-			[ -n "$udp_node" ] && {
-				if [ "$udp_node" = "default" ]; then
-					local GLOBAL_UDP_NODE=$(get_cache_var "ACL_GLOBAL_UDP_node")
-					[ -n "${GLOBAL_UDP_NODE}" ] && GLOBAL_UDP_redir_port=$(get_cache_var "ACL_GLOBAL_UDP_redir_port")
-					if [ -n "${GLOBAL_UDP_NODE}" ]; then
-						set_cache_var "ACL_${sid}_udp_node" "${GLOBAL_UDP_NODE}"
-						set_cache_var "ACL_${sid}_udp_redir_port" "${GLOBAL_UDP_redir_port}"
-						set_cache_var "ACL_${sid}_udp_default" "1"
-					else
-						echolog "  - 全局节点未启用，跳过【${remarks}】"
-					fi
-				elif [ "$udp_node" = "tcp" ] || [ "$udp_node" = "$tcp_node" ]; then
-					udp_node=$(get_cache_var "ACL_${sid}_tcp_node")
-					udp_port=$(get_cache_var "ACL_${sid}_tcp_redir_port")
-					set_cache_var "ACL_${sid}_udp_node" "${udp_node}"
-					set_cache_var "ACL_${sid}_udp_redir_port" "${udp_port}"
-				else
-					[ "$(config_get_type $udp_node)" = "nodes" ] && {
-						if [ -n "${GLOBAL_UDP_NODE}" ] && [ "$udp_node" = "${GLOBAL_UDP_NODE}" ]; then
-							set_cache_var "ACL_${sid}_udp_node" "${GLOBAL_UDP_NODE}"
-							set_cache_var "ACL_${sid}_udp_redir_port" "${GLOBAL_UDP_redir_port}"
-							set_cache_var "ACL_${sid}_udp_default" "1"
-						else
-							_redir_port=$(get_cache_var "node_${udp_node}_redir_port")
-							_socks_port=$(get_cache_var "node_${udp_node}_socks_port")
-							if [ -n "${_socks_port}" ] && [ -n "${_redir_port}" ]; then
-								socks_port=${_socks_port}
-								udp_port=${_redir_port}
-							else
-								socks_port=$(get_new_port $(expr $socks_port + 1))
-								set_cache_var "node_${udp_node}_socks_port" "${socks_port}"
-								redir_port=$(get_new_port $(expr $redir_port + 1))
-								set_cache_var "node_${udp_node}_redir_port" "${redir_port}"
-								udp_port=$redir_port
-
-								local type=$(echo $(config_n_get $udp_node type) | tr 'A-Z' 'a-z')
-								if [ -n "${type}" ] && ([ "${type}" = "sing-box" ] || [ "${type}" = "xray" ]); then
-									config_file="acl/${udp_node}_UDP_${redir_port}.json"
-									config_file="$TMP_PATH/$config_file"
-									[ "${type}" = "sing-box" ] && type="singbox"
-									run_${type} flag=$udp_node node=$udp_node udp_redir_port=$redir_port config_file=$config_file
-								else
-									config_file="acl/${udp_node}_SOCKS_${socks_port}.json"
-									run_socks flag=$udp_node node=$udp_node bind=127.0.0.1 socks_port=$socks_port config_file=$config_file
-									local log_file=$TMP_ACL_PATH/ipt2socks_${udp_node}_${redir_port}.log
-									log_file="/dev/null"
-									run_ipt2socks flag=acl_${udp_node} local_port=$redir_port socks_address=127.0.0.1 socks_port=$socks_port log_file=$log_file
-								fi
-							fi
-							set_cache_var "ACL_${sid}_udp_node" "${udp_node}"
-							set_cache_var "ACL_${sid}_udp_redir_port" "${udp_port}"
-						fi
-					}
-				fi
-			}
-			unset enabled sid remarks sources interface tcp_no_redir_ports udp_no_redir_ports use_global_config tcp_node udp_node use_direct_list use_proxy_list use_block_list use_gfw_list chn_list tcp_proxy_mode udp_proxy_mode filter_proxy_ipv6 dns_mode remote_dns v2ray_dns_mode remote_dns_doh remote_dns_client_ip
-			unset _ip _mac _iprange _ipset _ip_or_mac source_list tcp_port udp_port config_file _extra_param
-			unset _china_ng_listen _chinadns_local_dns _direct_dns_mode chinadns_ng_default_tag dnsmasq_filter_proxy_ipv6
-		done
-		unset socks_port redir_port dns_port dnsmasq_port chinadns_port
-	}
+get_ip6t_bin() {
+	echo $ip6t
 }
 
 start() {
-	mkdir -p /tmp/etc /tmp/log $TMP_PATH $TMP_BIN_PATH $TMP_SCRIPT_FUNC_PATH $TMP_ROUTE_PATH $TMP_ACL_PATH $TMP_PATH2
-	get_config
-	export V2RAY_LOCATION_ASSET=$(config_t_get global_rules v2ray_location_asset "/usr/share/v2ray/")
-	export XRAY_LOCATION_ASSET=$V2RAY_LOCATION_ASSET
-	export ENABLE_DEPRECATED_GEOSITE=true
-	export ENABLE_DEPRECATED_GEOIP=true
-	ulimit -n 65535
-	start_haproxy
-	start_socks
-	nftflag=0
-	local use_nft=$(config_t_get global_forwarding use_nft 0)
-	local USE_TABLES
-	if [ "$use_nft" == 0 ]; then
-		if [ -n "$(command -v iptables-legacy || command -v iptables)" ] && [ -n "$(command -v ipset)" ] && [ -n "$(dnsmasq --version | grep 'Compile time options:.* ipset')" ]; then
-			USE_TABLES="iptables"
-		else
-			echolog "系统未安装iptables或ipset或Dnsmasq没有开启ipset支持，无法使用iptables+ipset透明代理！"
-			if [ -n "$(command -v fw4)" ] && [ -n "$(command -v nft)" ] && [ -n "$(dnsmasq --version | grep 'Compile time options:.* nftset')" ]; then
-				echolog "检测到fw4，使用nftables进行透明代理。"
-				USE_TABLES="nftables"
-				nftflag=1
-				config_t_set global_forwarding use_nft 1
-				uci -q commit ${CONFIG}
-			fi
-		fi
-	else
-		if [ -n "$(dnsmasq --version | grep 'Compile time options:.* nftset')" ]; then
-			USE_TABLES="nftables"
-			nftflag=1
-		else
-			echolog "Dnsmasq软件包不满足nftables透明代理要求，如需使用请确保dnsmasq版本在2.87以上并开启nftset支持。"
-		fi
-	fi
-
-	check_depends $USE_TABLES
-
-	[ "$USE_TABLES" = "nftables" ] && {
-		dnsmasq_version=$(dnsmasq -v | grep -i "Dnsmasq version " | awk '{print $3}')
-		[ "$(expr $dnsmasq_version \>= 2.90)" == 0 ] && echolog "Dnsmasq版本低于2.90，建议升级至2.90及以上版本以避免部分情况下Dnsmasq崩溃问题！"
-	}
-
-	if [ "$ENABLED_DEFAULT_ACL" == 1 ] || [ "$ENABLED_ACLS" == 1 ]; then
-		[ "$(uci -q get dhcp.@dnsmasq[0].dns_redirect)" == "1" ] && {
-			uci -q set ${CONFIG}.@global[0].dnsmasq_dns_redirect='1'
-			uci -q commit ${CONFIG}
-			uci -q set dhcp.@dnsmasq[0].dns_redirect='0'
-			uci -q commit dhcp
-			lua $APP_PATH/helper_dnsmasq.lua restart -LOG 0
-		}
-	fi
-
-	[ "$ENABLED_DEFAULT_ACL" == 1 ] && {
-		mkdir -p ${GLOBAL_ACL_PATH}
-		start_redir TCP
-		start_redir UDP
-		start_dns
-	}
-	[ -n "$USE_TABLES" ] && source $APP_PATH/${USE_TABLES}.sh start
-	set_cache_var "USE_TABLES" "$USE_TABLES"
-	if [ "$ENABLED_DEFAULT_ACL" == 1 ] || [ "$ENABLED_ACLS" == 1 ]; then
-		bridge_nf_ipt=$(sysctl -e -n net.bridge.bridge-nf-call-iptables)
-		set_cache_var "bak_bridge_nf_ipt" "$bridge_nf_ipt"
-		sysctl -w net.bridge.bridge-nf-call-iptables=0 >/dev/null 2>&1
-		[ "$PROXY_IPV6" == "1" ] && {
-			bridge_nf_ip6t=$(sysctl -e -n net.bridge.bridge-nf-call-ip6tables)
-			set_cache_var "bak_bridge_nf_ip6t" "$bridge_nf_ip6t"
-			sysctl -w net.bridge.bridge-nf-call-ip6tables=0 >/dev/null 2>&1
-		}
-	fi
-	
-	start_crontab
-	echolog "运行完成！\n"
+	[ "$ENABLED_DEFAULT_ACL" == 0 -a "$ENABLED_ACLS" == 0 ] && return
+	add_firewall_rule
+	gen_include
 }
 
 stop() {
-	clean_log
-	eval_cache_var
-	[ -n "$USE_TABLES" ] && source $APP_PATH/${USE_TABLES}.sh stop
-	delete_ip2route
-	# 结束 SS 插件进程
-	# kill_all xray-plugin v2ray-plugin obfs-local shadow-tls
-	local pid_file pid
-	find "$TMP_PATH" -type f -name '*_plugin.pid' 2>/dev/null | while read -r pid_file; do
-		read -r pid < "$pid_file"
-		if [ -n "$pid" ]; then
-			kill -9 "$pid" >/dev/null 2>&1
-		fi
-	done
-	pgrep -f "sleep.*(6s|9s|58s)" | xargs kill -9 >/dev/null 2>&1
-	pgrep -af "${CONFIG}/" | awk '! /app\.sh|subscribe\.lua|rule_update\.lua|tasks\.sh|ujail/{print $1}' | xargs kill -9 >/dev/null 2>&1
-	stop_crontab
-	source $APP_PATH/helper_smartdns.sh del
-	rm -rf $GLOBAL_DNSMASQ_CONF
-	rm -rf $GLOBAL_DNSMASQ_CONF_PATH
-	[ "1" = "1" ] && {
-		#restore logic
-		bak_dnsmasq_dns_redirect=$(config_t_get global dnsmasq_dns_redirect)
-		[ -n "${bak_dnsmasq_dns_redirect}" ] && {
-			uci -q set dhcp.@dnsmasq[0].dns_redirect="${bak_dnsmasq_dns_redirect}"
-			uci -q commit dhcp
-			uci -q delete ${CONFIG}.@global[0].dnsmasq_dns_redirect
-			uci -q commit ${CONFIG}
-		}
-		if [ -z "${ACL_default_dns_port}" ] || [ -n "${bak_dnsmasq_dns_redirect}" ]; then
-			uci -q del_list dhcp.@dnsmasq[0].addnmount="${GLOBAL_DNSMASQ_CONF_PATH}"
-			uci -q commit dhcp
-			lua $APP_PATH/helper_dnsmasq.lua restart -LOG 0
-		fi
-		[ -n "${bak_bridge_nf_ipt}" ] && sysctl -w net.bridge.bridge-nf-call-iptables=${bak_bridge_nf_ipt} >/dev/null 2>&1
-		[ -n "${bak_bridge_nf_ip6t}" ] && sysctl -w net.bridge.bridge-nf-call-ip6tables=${bak_bridge_nf_ip6t} >/dev/null 2>&1
+	del_firewall_rule
+	[ $(config_t_get global flush_set_on_reboot "0") = "1" -o $(config_t_get global flush_set "0") = "1" ] && {
+		uci -q delete ${CONFIG}.@global[0].flush_set
+		uci -q commit ${CONFIG}
+		flush_ipset
+		rm -rf /tmp/etc/passwall_tmp/singbox*
+		rm -rf /tmp/etc/passwall_tmp/dnsmasq*
 	}
-	rm -rf $TMP_PATH
-	rm -rf /tmp/lock/${CONFIG}_socks_auto_switch*
-	rm -rf /tmp/lock/${CONFIG}_lease2hosts*
-	echolog "清空并关闭相关程序和缓存完成。"
-	exit 0
-}
-
-get_config() {
-	ENABLED_DEFAULT_ACL=0
-	TCP_REDIR_PORT=1041
-	UDP_REDIR_PORT=1051
-	ENABLED=$(config_t_get global enabled 0)
-	SOCKS_ENABLED=$(config_t_get global socks_enabled 0)
-	TCP_NODE=$(config_t_get global tcp_node)
-	UDP_NODE=$(config_t_get global udp_node)
-	TCP_UDP=0
-	if [ "$UDP_NODE" == "tcp" ]; then
-		UDP_NODE=$TCP_NODE
-		TCP_UDP=1
-	elif [ "$UDP_NODE" == "$TCP_NODE" ]; then
-		TCP_UDP=1
-	fi
-	[ "$ENABLED" == 1 ] && {
-		[ -n "$TCP_NODE" ] && [ "$(config_get_type $TCP_NODE)" == "nodes" ] && ENABLED_DEFAULT_ACL=1
-		[ -n "$UDP_NODE" ] && [ "$(config_get_type $UDP_NODE)" == "nodes" ] && ENABLED_DEFAULT_ACL=1
-	}
-	ENABLED_ACLS=$(config_t_get global acl_enable 0)
-	[ "$ENABLED_ACLS" == 1 ] && {
-		[ "$(uci show ${CONFIG} | grep "@acl_rule" | grep "enabled='1'" | wc -l)" == 0 ] && ENABLED_ACLS=0
-	}
-
-	TCP_PROXY_WAY=$(config_t_get global_forwarding tcp_proxy_way redirect)
-	PROXY_IPV6=$(config_t_get global_forwarding ipv6_tproxy 0)
-	TCP_REDIR_PORTS=$(config_t_get global_forwarding tcp_redir_ports '80,443')
-	UDP_REDIR_PORTS=$(config_t_get global_forwarding udp_redir_ports '1:65535')
-	TCP_NO_REDIR_PORTS=$(config_t_get global_forwarding tcp_no_redir_ports 'disable')
-	UDP_NO_REDIR_PORTS=$(config_t_get global_forwarding udp_no_redir_ports 'disable')
-	TCP_PROXY_DROP_PORTS=$(config_t_get global_forwarding tcp_proxy_drop_ports 'disable')
-	UDP_PROXY_DROP_PORTS=$(config_t_get global_forwarding udp_proxy_drop_ports '80,443')
-	USE_DIRECT_LIST=$(config_t_get global use_direct_list 1)
-	USE_PROXY_LIST=$(config_t_get global use_proxy_list 1)
-	USE_BLOCK_LIST=$(config_t_get global use_block_list 1)
-	USE_GFW_LIST=$(config_t_get global use_gfw_list 1)
-	CHN_LIST=$(config_t_get global chn_list direct)
-	TCP_PROXY_MODE=$(config_t_get global tcp_proxy_mode proxy)
-	UDP_PROXY_MODE=$(config_t_get global udp_proxy_mode proxy)
-	[ "${TCP_PROXY_MODE}" != "disable" ] && TCP_PROXY_MODE="proxy"
-	[ "${UDP_PROXY_MODE}" != "disable" ] && UDP_PROXY_MODE="proxy"
-	LOCALHOST_PROXY=$(config_t_get global localhost_proxy 1)
-	[ "${LOCALHOST_PROXY}" == 1 ] && {
-		LOCALHOST_TCP_PROXY_MODE=$TCP_PROXY_MODE
-		LOCALHOST_UDP_PROXY_MODE=$UDP_PROXY_MODE
-	}
-	CLIENT_PROXY=$(config_t_get global client_proxy 1)
-	DNS_SHUNT=$(config_t_get global dns_shunt dnsmasq)
-	[ -z "$(first_type $DNS_SHUNT)" ] && DNS_SHUNT="dnsmasq"
-	DNS_MODE=$(config_t_get global dns_mode tcp)
-	[ "$DNS_SHUNT" = "smartdns" ] && DNS_MODE=$(config_t_get global smartdns_dns_mode socks)
-	REMOTE_DNS=$(config_t_get global remote_dns 1.1.1.1:53 | sed 's/#/:/g' | sed -E 's/\:([^:]+)$/#\1/g')
-	USE_DEFAULT_DNS=$(config_t_get global use_default_dns direct)
-	FILTER_PROXY_IPV6=$(config_t_get global filter_proxy_ipv6 0)
-	DNS_REDIRECT=$(config_t_get global dns_redirect 1)
-
-	REDIRECT_LIST="socks ss ss-rust ssr sing-box xray trojan-plus naiveproxy hysteria2"
-	TPROXY_LIST="socks ss ss-rust ssr sing-box xray trojan-plus hysteria2"
-
-	NEXT_DNS_LISTEN_PORT=15353
-	TUN_DNS="127.0.0.1#${NEXT_DNS_LISTEN_PORT}"
-	DNS_CACHE=0
-	DIRECT_DNS_QUERY_STRATEGY="UseIP"
-	REMOTE_DNS_QUERY_STRATEGY="UseIP"
-	[ "$FILTER_PROXY_IPV6" = "1" ] && REMOTE_DNS_QUERY_STRATEGY="UseIPv4"
-	DNSMASQ_FILTER_PROXY_IPV6=${FILTER_PROXY_IPV6}
-	
-	RESOLVFILE=/tmp/resolv.conf.d/resolv.conf.auto
-	[ -f "${RESOLVFILE}" ] && [ -s "${RESOLVFILE}" ] || RESOLVFILE=/tmp/resolv.conf.auto
-
-	ISP_DNS=$(cat $RESOLVFILE 2>/dev/null | grep -E -o "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | grep -v -E '^(0\.0\.0\.0|127\.0\.0\.1)$' | awk '!seen[$0]++')
-	ISP_DNS6=$(cat $RESOLVFILE 2>/dev/null | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | awk -F % '{print $1}' | awk -F " " '{print $2}' | grep -v -Fx ::1 | grep -v -Fx :: | awk '!seen[$0]++')
-
-	DEFAULT_DNS=$(uci show dhcp.@dnsmasq[0] | grep "\.server=" | awk -F '=' '{print $2}' | sed "s/'//g" | tr ' ' '\n' | grep -v "\/" | sed ':label;N;s/\n/,/;b label')
-	[ -z "${DEFAULT_DNS}" ] && [ "$(echo $ISP_DNS | tr ' ' '\n' | wc -l)" -ge 1 ] && DEFAULT_DNS=$(echo -n $ISP_DNS | tr ' ' '\n' | tr '\n' ',' | sed 's/,$//')
-	LOCAL_DNS="${DEFAULT_DNS:-119.29.29.29,223.5.5.5}"
-	IPT_APPEND_DNS=${LOCAL_DNS}
-
-	DNSMASQ_CONF_DIR=/tmp/dnsmasq.d
-	DEFAULT_DNSMASQ_CFGID="$(uci -q show "dhcp.@dnsmasq[0]" | awk 'NR==1 {split($0, conf, /[.=]/); print conf[2]}')"
-	if [ -f "/tmp/etc/dnsmasq.conf.$DEFAULT_DNSMASQ_CFGID" ]; then
-		DNSMASQ_CONF_DIR="$(awk -F '=' '/^conf-dir=/ {print $2}' "/tmp/etc/dnsmasq.conf.$DEFAULT_DNSMASQ_CFGID")"
-		if [ -n "$DNSMASQ_CONF_DIR" ]; then
-			DNSMASQ_CONF_DIR=${DNSMASQ_CONF_DIR%*/}
-		else
-			DNSMASQ_CONF_DIR="/tmp/dnsmasq.d"
-		fi
-	fi
-	set_cache_var GLOBAL_DNSMASQ_CONF ${DNSMASQ_CONF_DIR}/dnsmasq-${CONFIG}.conf
-	set_cache_var GLOBAL_DNSMASQ_CONF_PATH ${GLOBAL_ACL_PATH}/dnsmasq.d
+	flush_include
 }
 
 arg1=$1
 shift
 case $arg1 in
-add_ip2route)
-	add_ip2route $@
+RULE_LAST_INDEX)
+	RULE_LAST_INDEX "$@"
 	;;
-echolog)
-	echolog $@
+insert_rule_before)
+	insert_rule_before "$@"
 	;;
-get_new_port)
-	get_new_port $@
+insert_rule_after)
+	insert_rule_after "$@"
 	;;
-get_cache_var)
-	get_cache_var $@
+get_ipt_bin)
+	get_ipt_bin
 	;;
-set_cache_var)
-	set_cache_var $@
+get_ip6t_bin)
+	get_ip6t_bin
 	;;
-run_socks)
-	run_socks $@
+get_wan_ip)
+	get_wan_ip
 	;;
-socks_node_switch)
-	socks_node_switch $@
+get_wan6_ip)
+	get_wan6_ip
 	;;
-start)
-	start
+filter_direct_node_list)
+	filter_direct_node_list
 	;;
 stop)
 	stop
 	;;
+start)
+	start
+	;;
+*) ;;
 esac
